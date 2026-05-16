@@ -4,7 +4,10 @@
 .env.*.local
 .env.prod
 .env.production
-
+*.md
+*.sh
+*swarm*
+*claude*
 # Credentials & Secrets
 secrets/
 credentials.json
