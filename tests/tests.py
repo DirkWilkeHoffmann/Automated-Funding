@@ -1,9 +1,10 @@
 import json
+import os
 import time
 
 import requests
 
-BASE = "https://automated-funding-api.calmsmoke-5afc5b29.eastus.azurecontainerapps.io"
+BASE = os.environ.get("TEST_API_BASE_URL", "http://localhost:8000")
 
 
 def show(resp):

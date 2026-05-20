@@ -4,6 +4,7 @@ import io
 import logging
 import re
 import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
@@ -20,7 +21,6 @@ from utils.constants import (
 )
 from utils.utils_helpers import (
     initial_normalize_url,
-    is_charity_commission_url,
     log_message,
     normalize_url,
     safe_filename_from_url,
@@ -28,9 +28,20 @@ from utils.utils_helpers import (
 
 logger = logging.getLogger(__name__)
 
+_html_cache: "OrderedDict[str, Tuple[str, float]]" = OrderedDict()
+_HTML_CACHE_MAX = 500
+_CACHE_TTL = 86400  # 24 hours
+
 
 def fetch_page(url: str, retries: int = 4, backoff_factor: int = 2) -> Optional[str]:
-    """Fetch a page with exponential backoff on rate limiting."""
+    """Fetch a page with exponential backoff on rate limiting. Caches responses for 24h."""
+    cached = _html_cache.get(url)
+    if cached:
+        html, ts = cached
+        if time.time() - ts < _CACHE_TTL:
+            return html
+        _html_cache.pop(url, None)
+
     for attempt in range(retries):
         try:
             resp = requests.get(url, headers=HEADERS, timeout=20)
@@ -40,7 +51,11 @@ def fetch_page(url: str, retries: int = 4, backoff_factor: int = 2) -> Optional[
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
-            return resp.text
+            html = resp.text
+            if len(_html_cache) >= _HTML_CACHE_MAX:
+                _html_cache.popitem(last=False)
+            _html_cache[url] = (html, time.time())
+            return html
         except requests.exceptions.RequestException as e:
             if attempt < retries - 1:
                 pause = (backoff_factor**attempt) * 2
@@ -61,48 +76,6 @@ def extract_visible_text(html: str) -> str:
         for t in soup.find_all(["h1", "h2", "h3", "p", "li", "td", "th"])
     )
     return re.sub(r"\s+", " ", text).strip()
-
-
-def extract_charity_commission_name(html: Optional[str]) -> Optional[str]:
-    """Extract charity name from Charity Commission HTML."""
-    if not html:
-        return None
-    soup = BeautifulSoup(html, "html.parser")
-    h1 = soup.find("h1", class_=re.compile(r"\bgovuk-heading-l\b"))
-    if not h1:
-        return None
-    for span in h1.find_all(class_=re.compile(r"\bsr-only\b")):
-        span.decompose()
-    text = h1.get_text(" ", strip=True)
-    return text or None
-
-
-def extract_charity_commission_accounts_links(
-    html: Optional[str], base_url: str
-) -> List[Tuple[str, str]]:
-    """Extract financial accounts download links from Charity Commission page."""
-    if not html:
-        return []
-    soup = BeautifulSoup(html, "html.parser")
-    links: List[Tuple[str, str]] = []
-    for anchor in soup.select("a.accounts-download-link, a[href*='accounts-resource']"):
-        href = anchor.get("href")
-        if not href:
-            continue
-        label = anchor.get("aria-label") or anchor.get_text(" ", strip=True)
-        label = re.sub(r"\s+", " ", (label or "")).strip()
-        full_url = urljoin(base_url, href)
-        if not label:
-            label = "Accounts download"
-        links.append((label, full_url))
-    deduped: List[Tuple[str, str]] = []
-    seen = set()
-    for label, href in links:
-        if href in seen:
-            continue
-        seen.add(href)
-        deduped.append((label, href))
-    return deduped
 
 
 def download_and_extract_pdf_text(url: str, *, max_chars: int = 20000) -> Dict[str, Any]:
@@ -146,7 +119,7 @@ def discover_links(
     seed_url: str, discovery_depth: int = DISCOVERY_DEPTH, max_pages: int = MAX_DISCOVERY_PAGES
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Crawl only pages related to the same base entity (same charity ID or program).
+    Crawl only pages related to the same base domain and seed path.
     Returns a dict of discovered links with metadata.
     """
     seed_base = initial_normalize_url(seed_url)
@@ -185,11 +158,6 @@ def discover_links(
             ):
                 continue
 
-            # Restrict to links under the same base path for Charity Commission
-            if "charitycommission.gov.uk" in base_domain:
-                if not href.startswith(seed_base):
-                    continue
-
             hnorm = normalize_url(href)
             anchor = (a.get_text(" ", strip=True) or "").strip()
             meta = candidates.setdefault(
@@ -207,7 +175,7 @@ def discover_links(
         time.sleep(PAUSE_BETWEEN_REQUESTS)
 
     log_message(
-        f"➕ Found {len(candidates)} internal links (visited {pages_visited} pages) from {seed_base}"
+        f"Found {len(candidates)} internal links (visited {pages_visited} pages) from {seed_base}"
     )
     return candidates
 
@@ -236,7 +204,7 @@ def score_candidate(url: str, meta: Dict[str, Any]) -> int:
 
 def prioritized_crawl(seed_url: str) -> Tuple[str, str, int, List[str], Dict[str, Any]]:
     """
-    Crawl and prioritize only the related internal pages.
+    Crawl and prioritize the most relevant internal pages for a seed URL.
 
     Returns:
         (combined_text, folder_path, num_pages_visited, visited_urls, pdf_metadata)
@@ -250,7 +218,6 @@ def prioritized_crawl(seed_url: str) -> Tuple[str, str, int, List[str], Dict[str
     domain_folder = os.path.join(SAVE_DIR, safe_filename_from_url(seed_base))
     os.makedirs(domain_folder, exist_ok=True)
 
-    is_charity_commission = is_charity_commission_url(seed_norm)
     candidates = discover_links(seed_norm)
     candidates.setdefault(
         seed_norm, {"anchor_texts": set(), "source_titles": set(), "source_snippets": set()}
@@ -259,13 +226,7 @@ def prioritized_crawl(seed_url: str) -> Tuple[str, str, int, List[str], Dict[str
     scored.sort(reverse=True)
 
     top_links = [url for _, url in scored[:MAX_PAGES]]
-    if is_charity_commission:
-        accounts_url = f"{seed_base}/accounts-and-annual-returns"
-        if accounts_url not in top_links:
-            if len(top_links) >= MAX_PAGES:
-                top_links = top_links[: MAX_PAGES - 1]
-            top_links.append(accounts_url)
-    log_message(f"🌐 Fetching top {len(top_links)} links from {seed_base}")
+    log_message(f"Fetching top {len(top_links)} links from {seed_base}")
 
     visited_urls: List[str] = []
     seen_urls: set = set()
@@ -278,34 +239,11 @@ def prioritized_crawl(seed_url: str) -> Tuple[str, str, int, List[str], Dict[str
     pdf_meta: Dict[str, Any] = {"pdf_read": False, "pdf_url": "", "pdf_pages": 0, "pdf_text": ""}
     all_text = []
     for i, url in enumerate(top_links, 1):
-        log_message(f"&nbsp;&nbsp;↳ ({i}/{len(top_links)}) {url}")
+        log_message(f"  ({i}/{len(top_links)}) {url}")
         html = fetch_page(url)
         if not html:
             continue
         text = extract_visible_text(html)
-        if is_charity_commission and "accounts-and-annual-returns" in url:
-            accounts_links = extract_charity_commission_accounts_links(html, url)
-            if accounts_links:
-                label, href = accounts_links[0]
-                lines = ["Accounts and annual returns download (latest):", f"- {label}: {href}"]
-                pdf_meta["pdf_url"] = href
-                pdf_result = download_and_extract_pdf_text(href)
-                if pdf_result.get("success"):
-                    pdf_meta["pdf_read"] = True
-                    pdf_meta["pdf_pages"] = pdf_result.get("num_pages", 0)
-                    pdf_text = pdf_result.get("text", "")
-                    pdf_meta["pdf_text"] = pdf_text
-                    if pdf_text:
-                        lines.append("Accounts PDF extracted text:")
-                        lines.append(pdf_text)
-                else:
-                    log_message(
-                        f"PDF extraction failed for {href}: {pdf_result.get('error')}", "warning"
-                    )
-                text = f"{text}\n" + "\n".join(lines)
-                if href not in seen_urls:
-                    visited_urls.append(href)
-                    seen_urls.add(href)
         all_text.append(text)
         fname = safe_filename_from_url(url) + ".txt"
         with open(os.path.join(domain_folder, fname), "w", encoding="utf-8") as f:

@@ -2,15 +2,26 @@
 
 import type { ChangeEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  CheckCircle,
+  Clock,
+  FileText,
+  Link2,
+  Play,
+  RefreshCw,
+  RotateCcw,
+  StopCircle,
+  Trash2,
+  Upload,
+  X,
+} from "lucide-react";
 import { api } from "../lib/api";
+import { eligibilityVariantMap } from "../lib/eligibility";
 import { clearCache, readCache, writeCache } from "../lib/storage";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./ui/card";
-import { Input } from "./ui/input";
-import { Label } from "./ui/label";
 import { Progress } from "./ui/progress";
-import { Textarea } from "./ui/textarea";
+import { cn } from "../lib/utils";
 
 type JobStatus = {
   job_id: string;
@@ -41,10 +52,7 @@ type PrepSummary = {
   normalizedMap: Record<string, string>;
 };
 
-type QueueStats = {
-  uniqueDomains: number;
-  totalQueued: number;
-};
+type QueueStats = { uniqueDomains: number; totalQueued: number };
 
 type ScrapeCache = {
   manualInput: string;
@@ -54,13 +62,12 @@ type ScrapeCache = {
   job: JobStatus | null;
 };
 
-const extractUrls = (text: string) => {
-  const matches = text.match(/https?:\/\/[^\s,"'>)]+/gi) || [];
-  return matches.map((u) => u.trim());
-};
+const extractUrls = (text: string) =>
+  (text.match(/https?:\/\/[^\s,"'>)]+/gi) || []).map((u) => u.trim());
 
 const SCRAPE_CACHE_KEY = "scrape_form_cache_v1";
 const RESULTS_FORCE_REFRESH_KEY = "results_force_refresh_v1";
+
 
 export default function ScrapeForm() {
   const [manualInput, setManualInput] = useState("");
@@ -71,6 +78,7 @@ export default function ScrapeForm() {
   const [job, setJob] = useState<JobStatus | null>(null);
   const [isPreparing, setIsPreparing] = useState(false);
   const [isScraping, setIsScraping] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
   const [isRefreshingSheet, setIsRefreshingSheet] = useState(false);
   const [sheetRefreshMessage, setSheetRefreshMessage] = useState<string | null>(null);
   const [sheetRefreshError, setSheetRefreshError] = useState<string | null>(null);
@@ -97,16 +105,10 @@ export default function ScrapeForm() {
 
   useEffect(() => {
     const cached = readCache<ScrapeCache>(SCRAPE_CACHE_KEY)?.value;
-    if (!cached) {
-      setHydratedCache(true);
-      return;
-    }
-    const cachedSummary = cached.prepSummary
-      ? { ...cached.prepSummary, normalizedMap: cached.prepSummary.normalizedMap || {} }
-      : null;
+    if (!cached) { setHydratedCache(true); return; }
     setManualInput(cached.manualInput || "");
     setStagedUrls(cached.stagedUrls || []);
-    setPrepSummary(cachedSummary);
+    setPrepSummary(cached.prepSummary ? { ...cached.prepSummary, normalizedMap: cached.prepSummary.normalizedMap || {} } : null);
     setQueueStats(cached.queueStats || calcQueueStats(cached.stagedUrls || []));
     setJob(cached.job || null);
     setHydratedCache(true);
@@ -114,14 +116,7 @@ export default function ScrapeForm() {
 
   useEffect(() => {
     if (!hydratedCache) return;
-    const payload: ScrapeCache = {
-      manualInput,
-      stagedUrls,
-      prepSummary,
-      queueStats,
-      job,
-    };
-    writeCache(SCRAPE_CACHE_KEY, payload);
+    writeCache(SCRAPE_CACHE_KEY, { manualInput, stagedUrls, prepSummary, queueStats, job });
   }, [hydratedCache, manualInput, stagedUrls, prepSummary, queueStats, job]);
 
   useEffect(() => {
@@ -146,11 +141,7 @@ export default function ScrapeForm() {
 
   const prepareAndStage = async (urls: string[]) => {
     const candidates = Array.from(new Set(urls.map((u) => u.trim()))).filter(Boolean);
-    if (candidates.length === 0) {
-      setPrepError("No URLs detected to stage.");
-      return;
-    }
-
+    if (candidates.length === 0) { setPrepError("No URLs detected to stage."); return; }
     setPrepError(null);
     setIsPreparing(true);
     try {
@@ -159,10 +150,7 @@ export default function ScrapeForm() {
       setStagedUrls((prev) => {
         const next = [...prev];
         res.to_scrape.forEach((u: string) => {
-          if (!next.includes(u)) {
-            next.push(u);
-            addedNow.push(u);
-          }
+          if (!next.includes(u)) { next.push(u); addedNow.push(u); }
         });
         setQueueStats(calcQueueStats(next));
         return next;
@@ -180,31 +168,23 @@ export default function ScrapeForm() {
     }
   };
 
-  const handleManualStage = async () => {
-    await prepareAndStage(detectedManualUrls);
-  };
+  const handleManualStage = () => prepareAndStage(detectedManualUrls);
 
   const handleCsvUpload = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
     try {
       const text = await file.text();
-      const urls = extractUrls(text);
-      await prepareAndStage(urls);
+      await prepareAndStage(extractUrls(text));
     } catch (err: any) {
       setPrepError(err.message || "Could not read CSV file.");
     } finally {
-      // reset so the same file can be re-selected if needed
       event.target.value = "";
     }
   };
 
   const removeFromQueue = (url: string) => {
-    setStagedUrls((prev) => {
-      const next = prev.filter((u) => u !== url);
-      setQueueStats(calcQueueStats(next));
-      return next;
-    });
+    setStagedUrls((prev) => { const next = prev.filter((u) => u !== url); setQueueStats(calcQueueStats(next)); return next; });
   };
 
   const clearQueue = () => {
@@ -238,12 +218,7 @@ export default function ScrapeForm() {
       const status = await api.jobStatus(payload.job_id);
       setJob(status);
       setStagedUrls([]);
-      setPrepSummary({
-        added: payload.to_scrape || [],
-        alreadyProcessed: payload.already_processed || [],
-        duplicatesInPayload: payload.duplicates_in_payload || [],
-        normalizedMap: {},
-      });
+      setPrepSummary({ added: payload.to_scrape || [], alreadyProcessed: payload.already_processed || [], duplicatesInPayload: payload.duplicates_in_payload || [], normalizedMap: {} });
       setQueueStats({ uniqueDomains: 0, totalQueued: 0 });
     } catch (err: any) {
       setJobError(err.message || "Failed to start scrape job.");
@@ -255,152 +230,141 @@ export default function ScrapeForm() {
   const clearCompletedJob = () => {
     setJob(null);
     setJobError(null);
+    setIsCancelling(false);
     lastCompletedJobId.current = null;
     clearCache(RESULTS_FORCE_REFRESH_KEY);
   };
 
+  const handleCancel = async () => {
+    if (!job || job.done) return;
+    setIsCancelling(true);
+    try {
+      await api.cancelJob(job.job_id);
+    } catch {
+      // Job may have already finished — polling will reflect done state
+    }
+  };
+
+  const requeueFailed = () => {
+    if (!job || job.errors.length === 0) return;
+    prepareAndStage(job.errors.map((e) => e.url));
+  };
+
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
+      {/* Control bar */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <p className="text-xs uppercase tracking-wide text-neutral-500">Scrape controls</p>
-          <p className="text-sm text-neutral-700">
-            Paste URLs, upload CSVs, queue them, and monitor jobs.
-          </p>
+          <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">Scrape controls</p>
+          <p className="mt-0.5 text-sm text-slate-600">Paste URLs or upload a CSV, queue them, then scrape.</p>
         </div>
         <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={refreshSheetConnection}
-            disabled={isRefreshingSheet}
-          >
-            {isRefreshingSheet ? "Refreshing sheet..." : "Refresh sheet"}
+          <Button variant="outline" size="sm" onClick={refreshSheetConnection} disabled={isRefreshingSheet} className="gap-1.5">
+            <RefreshCw size={13} className={cn(isRefreshingSheet && "animate-spin")} />
+            {isRefreshingSheet ? "Refreshing…" : "Refresh results"}
           </Button>
-          <Button variant="outline" size="sm" onClick={resetAll}>
-            Reset all fields
+          <Button variant="outline" size="sm" onClick={resetAll} className="gap-1.5">
+            <RotateCcw size={13} />
+            Reset all
           </Button>
         </div>
       </div>
-      {sheetRefreshMessage && <p className="text-xs text-neutral-500">{sheetRefreshMessage}</p>}
+      {sheetRefreshMessage && (
+        <p className="flex items-center gap-1.5 text-xs text-slate-500">
+          <CheckCircle size={12} className="text-emerald-500" /> {sheetRefreshMessage}
+        </p>
+      )}
       {sheetRefreshError && <p className="text-xs text-red-600">{sheetRefreshError}</p>}
 
-      <div className="grid gap-6 lg:grid-cols-2">
-        <Card className="relative overflow-hidden">
-          <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-neutral-900 via-orange-500 to-neutral-900" />
-          <CardHeader className="pb-2">
-            <div className="flex items-start justify-between gap-3">
-              <div className="space-y-1">
-                <Badge variant="accent" className="w-fit">
-                  Manual entry
-                </Badge>
-                <CardTitle>Paste one or many fund URLs</CardTitle>
-                <CardDescription>
-                  Enter as many URLs as you like - we will normalize and de-duplicate before
-                  scraping.
-                </CardDescription>
-              </div>
+      {/* Input cards */}
+      <div className="grid gap-5 lg:grid-cols-2">
+        {/* Manual entry */}
+        <div className="card-base overflow-hidden">
+          <div className="h-0.5 bg-gradient-to-r from-brand via-brand-dark to-transparent" />
+          <div className="px-5 py-4">
+            <div className="flex items-center gap-2 pb-3">
+              <Link2 size={15} className="text-brand" />
+              <p className="font-semibold text-slate-900">Paste fund URLs</p>
             </div>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <Textarea
+            <p className="mb-3 text-xs text-slate-500">
+              Enter as many URLs as you like — we normalize and de-duplicate before scraping.
+            </p>
+            <textarea
               value={manualInput}
               onChange={(e) => setManualInput(e.target.value)}
               placeholder={"https://example.org/grant-1\nhttps://example.org/grant-2"}
-              className="min-h-[170px]"
+              className="min-h-[160px] w-full"
             />
-            <div className="flex flex-wrap items-center justify-between gap-3 text-sm text-neutral-600">
-              <span>{detectedManualUrls.length} URL(s) detected</span>
-              <Button
-                variant="outline"
-                onClick={handleManualStage}
-                disabled={detectedManualUrls.length === 0 || isPreparing}
-              >
-                {isPreparing ? "Staging..." : "Add to queue"}
+            <div className="mt-3 flex items-center justify-between text-sm">
+              <span className="text-slate-500">{detectedManualUrls.length} URL{detectedManualUrls.length !== 1 ? "s" : ""} detected</span>
+              <Button variant="outline" size="sm" onClick={handleManualStage} disabled={detectedManualUrls.length === 0 || isPreparing} className="gap-1.5">
+                <Play size={12} />
+                {isPreparing ? "Staging…" : "Add to queue"}
               </Button>
             </div>
-          </CardContent>
-        </Card>
+          </div>
+        </div>
 
-        <Card className="relative overflow-hidden">
-          <div className="absolute inset-x-0 top-0 h-1 bg-neutral-900" />
-          <CardHeader className="pb-2">
-            <Badge variant="outline" className="w-fit">
-              CSV import
-            </Badge>
-            <CardTitle>Upload a CSV of potential funders</CardTitle>
-            <CardDescription>
-              We will scan the file for http(s) URLs, skip ones already in results, and stage the
-              rest.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="space-y-2">
-              <Label htmlFor="csv-upload">CSV file</Label>
-              <Input id="csv-upload" type="file" accept=".csv" onChange={handleCsvUpload} />
+        {/* CSV upload */}
+        <div className="card-base overflow-hidden">
+          <div className="h-0.5 bg-gradient-to-r from-slate-400 to-transparent" />
+          <div className="px-5 py-4">
+            <div className="flex items-center gap-2 pb-3">
+              <FileText size={15} className="text-slate-500" />
+              <p className="font-semibold text-slate-900">Upload a CSV</p>
             </div>
-            <p className="text-sm text-neutral-600">
-              Columns are auto-detected; any link found in the file will be added to the queue if it
-              is not already scraped.
+            <p className="mb-4 text-xs text-slate-500">
+              We scan the file for http(s) URLs, skip ones already in results, and stage the rest.
             </p>
-          </CardContent>
-        </Card>
+            <label
+              htmlFor="csv-upload"
+              className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-slate-200 bg-slate-50 px-4 py-8 text-center transition hover:border-brand/40 hover:bg-brand-50/30"
+            >
+              <Upload size={20} className="text-slate-400" />
+              <span className="text-sm font-medium text-slate-600">Click to choose CSV</span>
+              <span className="text-xs text-slate-400">Any column containing URLs will be picked up</span>
+              <input id="csv-upload" type="file" accept=".csv" className="sr-only" onChange={handleCsvUpload} />
+            </label>
+          </div>
+        </div>
       </div>
 
-      <Card className="overflow-hidden">
-        <div className="h-1 bg-gradient-to-r from-neutral-900 via-orange-500 to-neutral-900" />
-        <CardHeader className="pb-2">
-          <CardTitle className="flex items-center justify-between">
-            <span>Funds about to scrape</span>
-            <div className="flex items-center gap-2">
-              <Badge variant="outline">{stagedUrls.length} queued</Badge>
-            </div>
-          </CardTitle>
-          <CardDescription>
-            URLs must pass the pre-check (no duplicates). Already-processed funds are skipped.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      {/* Queue */}
+      <div className="card-base overflow-hidden">
+        <div className="flex items-center justify-between border-b border-slate-100 px-5 py-3.5">
+          <div>
+            <p className="font-semibold text-slate-900">Scrape queue</p>
+            <p className="text-xs text-slate-500">URLs must pass pre-check — duplicates and already-scraped entries are removed.</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="stat-pill">{stagedUrls.length} queued</span>
+            {queueStats.uniqueDomains > 0 && (
+              <span className="stat-pill">{queueStats.uniqueDomains} domains</span>
+            )}
+          </div>
+        </div>
+
+        <div className="px-5 py-4 space-y-4">
+          {/* Pre-check summary */}
           {prepSummary && (
-            <div className="rounded-lg border border-neutral-200 bg-neutral-50 p-3 text-sm text-neutral-800">
-              <p className="font-semibold text-neutral-900">Pre-check summary</p>
-              <div className="mt-2 grid gap-2 sm:grid-cols-4">
-                <div>
-                  <p className="text-xs uppercase tracking-wide text-neutral-500">Added to queue</p>
-                  <p className="text-lg font-semibold text-neutral-900">
-                    {prepSummary.added.length}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs uppercase tracking-wide text-neutral-500">
-                    Already in results
-                  </p>
-                  <p className="text-lg font-semibold text-neutral-900">
-                    {prepSummary.alreadyProcessed.length}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs uppercase tracking-wide text-neutral-500">
-                    Duplicates removed
-                  </p>
-                  <p className="text-lg font-semibold text-neutral-900">
-                    {prepSummary.duplicatesInPayload.length}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs uppercase tracking-wide text-neutral-500">
-                    Unique domains queued
-                  </p>
-                  <p className="text-lg font-semibold text-neutral-900">
-                    {queueStats.uniqueDomains}
-                  </p>
-                </div>
+            <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+              <p className="mb-3 text-xs font-bold uppercase tracking-wider text-slate-400">Pre-check summary</p>
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                {[
+                  { label: "Added", value: prepSummary.added.length, color: "text-emerald-700" },
+                  { label: "Already scraped", value: prepSummary.alreadyProcessed.length, color: "text-slate-600" },
+                  { label: "Duplicates removed", value: prepSummary.duplicatesInPayload.length, color: "text-slate-600" },
+                  { label: "Unique domains", value: queueStats.uniqueDomains, color: "text-slate-700" },
+                ].map(({ label, value, color }) => (
+                  <div key={label} className="rounded-lg bg-white border border-slate-100 p-3">
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">{label}</p>
+                    <p className={cn("mt-1 text-2xl font-bold", color)}>{value}</p>
+                  </div>
+                ))}
               </div>
-              {(prepSummary.alreadyProcessed.length > 0 ||
-                prepSummary.duplicatesInPayload.length > 0) && (
-                <p className="mt-2 text-xs text-neutral-600">
-                  Duplicate entries are ignored. Already-processed URLs are skipped - use the
-                  Expired scraped tab under Results to rescrape stale funds.
+              {(prepSummary.alreadyProcessed.length > 0 || prepSummary.duplicatesInPayload.length > 0) && (
+                <p className="mt-3 text-xs text-slate-500">
+                  Already-processed URLs are skipped. Use the <strong>Stale Funds</strong> tab to rescrape them.
                 </p>
               )}
             </div>
@@ -408,247 +372,180 @@ export default function ScrapeForm() {
 
           {prepError && <p className="text-sm text-red-600">{prepError}</p>}
 
-          <div className="space-y-2 rounded-xl border border-dashed border-neutral-300 p-4">
+          {/* URL list */}
+          <div className={cn(
+            "rounded-xl border-2 border-dashed p-3 transition",
+            stagedUrls.length === 0 ? "border-slate-200 bg-slate-50" : "border-slate-200 bg-white"
+          )}>
             {stagedUrls.length === 0 ? (
-              <p className="text-sm text-neutral-600">
-                Nothing queued yet. Paste URLs or upload a CSV to start.
+              <p className="py-4 text-center text-sm text-slate-400">
+                Nothing queued yet. Paste URLs or upload a CSV above.
               </p>
             ) : (
-              <ul className="space-y-2">
-                {stagedUrls.map((url, idx) => {
-                  return (
-                    <li
-                      key={url}
-                      className="flex items-start justify-between gap-3 rounded-lg border border-neutral-200 bg-white px-3 py-2"
-                    >
-                      <div className="min-w-0">
-                        <p className="text-[11px] uppercase tracking-wide text-neutral-500">
-                          #{idx + 1}
-                        </p>
-                        <p className="truncate text-sm font-semibold text-neutral-900">{url}</p>
-                        <p className="text-xs text-neutral-600">Domain: {safeDomain(url)}</p>
-                      </div>
-                      <Button variant="ghost" size="sm" onClick={() => removeFromQueue(url)}>
-                        Remove
-                      </Button>
-                    </li>
-                  );
-                })}
+              <ul className="space-y-1.5">
+                {stagedUrls.map((url, idx) => (
+                  <li key={url} className="flex items-center justify-between gap-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-medium text-slate-800">{url}</p>
+                      <p className="text-xs text-slate-400">#{idx + 1} · {safeDomain(url)}</p>
+                    </div>
+                    <button type="button" onClick={() => removeFromQueue(url)} className="shrink-0 rounded-md p-1 text-slate-400 hover:bg-red-50 hover:text-red-500">
+                      <X size={14} />
+                    </button>
+                  </li>
+                ))}
               </ul>
             )}
           </div>
 
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="space-x-2">
-              <Button
-                variant="ghost"
-                disabled={stagedUrls.length === 0 || isScraping}
-                onClick={clearQueue}
-              >
-                Clear queue
-              </Button>
-              <Badge variant="outline" className="align-middle">
-                {stagedUrls.length} ready to scrape
-              </Badge>
-              <Badge variant="muted" className="align-middle">
-                {queueStats.uniqueDomains} unique domains
-              </Badge>
-            </div>
-            <Button onClick={startScrape} disabled={stagedUrls.length === 0 || isScraping}>
-              {isScraping ? "Starting..." : "Scrape queued funds"}
+          {/* Actions */}
+          <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+            <Button variant="ghost" size="sm" disabled={stagedUrls.length === 0 || isScraping} onClick={clearQueue} className="gap-1.5 text-slate-500">
+              <Trash2 size={13} />
+              Clear queue
+            </Button>
+            <Button onClick={startScrape} disabled={stagedUrls.length === 0 || isScraping} className="gap-2 bg-brand text-white hover:bg-brand-dark">
+              <Play size={14} />
+              {isScraping ? "Starting…" : `Scrape ${stagedUrls.length} fund${stagedUrls.length !== 1 ? "s" : ""}`}
             </Button>
           </div>
 
           {jobError && <p className="text-sm text-red-600">{jobError}</p>}
 
+          {/* Job monitor */}
           {job && (
-            <div className="rounded-xl border border-neutral-200 bg-neutral-50 p-4">
-              {(() => {
-                const progressValue = Math.max(0, Math.min(100, Number(job.progress_percent) || 0));
-                const totalElapsed = formatSeconds(job.total_elapsed_seconds || 0);
-                const currentElapsed = formatSeconds(job.current_elapsed_seconds || 0);
-                const latestResult = job.results[job.results.length - 1];
-                const latestLabel =
-                  latestResult?.fund_name || latestResult?.fund_url || "Latest fund";
-                const visitedUrls: string[] = Array.isArray(latestResult?.visited_urls)
-                  ? latestResult.visited_urls.filter(
-                      (url: unknown): url is string => typeof url === "string"
-                    )
-                  : [];
-                return (
-                  <>
-                    <div className="flex flex-wrap items-center justify-between gap-3">
-                      <div>
-                        <p className="text-xs uppercase tracking-wide text-neutral-500">
-                          Job {job.job_id.slice(0, 8)}
-                        </p>
-                        <p className="text-sm font-semibold text-neutral-900">
-                          {job.done ? "Completed" : "Processing"} -{" "}
-                          {job.completed_urls || job.results.length}/{job.total_urls || "?"} done
-                        </p>
-                      </div>
-                      <div className="min-w-[200px]">
-                        <Progress value={progressValue} />
-                        <p className="mt-1 text-xs text-neutral-600">{progressValue}% complete</p>
-                        <p className="text-[11px] text-neutral-500">
-                          Total elapsed: {totalElapsed}
-                        </p>
-                      </div>
-                      {job.done && (
-                        <Button variant="ghost" size="sm" onClick={clearCompletedJob}>
-                          Clear completed job
-                        </Button>
-                      )}
-                    </div>
-                    {job.current_url && (
-                      <div className="mt-3 rounded-lg border border-neutral-200 bg-white p-3">
-                        <p className="text-[11px] uppercase tracking-wide text-neutral-500">
-                          Currently scraping
-                        </p>
-                        <p className="truncate text-sm font-semibold text-neutral-900">
-                          {job.current_url}
-                        </p>
-                        <p className="text-xs text-neutral-600">Elapsed: {currentElapsed}</p>
-                      </div>
+            <div className="card-section mt-2 space-y-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  {job.done ? (
+                    <CheckCircle size={16} className="text-emerald-500" />
+                  ) : (
+                    <RefreshCw size={16} className="animate-spin text-brand" />
+                  )}
+                  <div>
+                    <p className="text-sm font-semibold text-slate-800">
+                      {job.done ? "Completed" : "Processing"}
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      Job {job.job_id.slice(0, 8)} · {job.completed_urls ?? job.results.length}/{job.total_urls ?? "?"} done
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-1.5 text-xs text-slate-500">
+                    <Clock size={12} />
+                    {formatSeconds(job.total_elapsed_seconds || 0)}
+                  </div>
+                  {!job.done && (
+                    <Button variant="outline" size="sm" onClick={handleCancel} disabled={isCancelling} className="gap-1.5 border-red-200 text-red-600 hover:bg-red-50">
+                      <StopCircle size={12} />
+                      {isCancelling ? "Stopping…" : "Stop"}
+                    </Button>
+                  )}
+                  {job.done && (
+                    <Button variant="outline" size="sm" onClick={clearCompletedJob} className="gap-1.5">
+                      <X size={12} />
+                      Dismiss
+                    </Button>
+                  )}
+                </div>
+              </div>
+
+              <div>
+                <Progress value={Math.max(0, Math.min(100, Number(job.progress_percent) || 0))} />
+                <p className="mt-1 text-right text-xs text-slate-500">{Math.max(0, Math.min(100, Number(job.progress_percent) || 0))}%</p>
+              </div>
+
+              {job.current_url && (
+                <div className="rounded-lg border border-slate-200 bg-white px-3 py-2.5">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Currently scraping</p>
+                  <p className="mt-0.5 truncate text-sm font-medium text-slate-800">{job.current_url}</p>
+                  <p className="text-xs text-slate-400">{formatSeconds(job.current_elapsed_seconds || 0)} elapsed</p>
+                </div>
+              )}
+
+              {job.errors.length > 0 && (
+                <details className="rounded-lg border border-red-200 bg-red-50">
+                  <summary className="flex cursor-pointer items-center justify-between px-3 py-2">
+                    <span className="text-xs font-semibold text-red-700">
+                      {job.errors.length} error{job.errors.length !== 1 ? "s" : ""}
+                    </span>
+                    {job.done && (
+                      <Button variant="ghost" size="sm" onClick={(e) => { e.preventDefault(); requeueFailed(); }} className="h-6 gap-1 px-2 text-[11px] text-red-600 hover:bg-red-100">
+                        <RotateCcw size={11} />
+                        Re-queue failed
+                      </Button>
                     )}
-                    {job.errors.length > 0 && (
-                      <div className="mt-3 space-y-1">
-                        <p className="text-[11px] font-semibold uppercase tracking-wide text-red-600">
-                          Errors
-                        </p>
-                        {job.errors.map((err) => (
-                          <p key={err.url} className="text-sm text-red-600">
-                            {err.url}: {err.message}
-                          </p>
-                        ))}
-                      </div>
-                    )}
-                    {job.results.length > 0 && (
-                      <div className="mt-4 space-y-2">
-                        <p className="text-[11px] uppercase tracking-wide text-neutral-500">
-                          Latest results
-                        </p>
-                        <ul className="space-y-2 text-sm text-neutral-800">
-                          {job.results
-                            .slice(-5)
-                            .reverse()
-                            .map((res) => (
-                              <li
-                                key={`${res.fund_url}-${res.fund_name}`}
-                                className="flex items-start justify-between gap-3"
-                              >
-                                <div className="min-w-0">
-                                  <p className="truncate font-semibold text-neutral-900">
-                                    {res.fund_name || res.fund_url}
-                                  </p>
-                                  <p className="truncate text-xs text-neutral-500">
-                                    {res.fund_url}
-                                  </p>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  <Badge variant="outline" className="whitespace-nowrap">
-                                    {res.eligibility || "Pending"}
-                                  </Badge>
-                                  {isPdfRead(res.pdf_read) && (
-                                    <Badge variant="outline" className="whitespace-nowrap">
-                                      [x] PDF read
-                                    </Badge>
-                                  )}
-                                </div>
-                              </li>
-                            ))}
-                        </ul>
-                      </div>
-                    )}
-                    {visitedUrls.length > 0 && (
-                      <div className="mt-4 space-y-2">
-                        <p className="text-[11px] uppercase tracking-wide text-neutral-500">
-                          Scraped URLs (latest fund: {latestLabel})
-                        </p>
-                        <ul className="max-h-48 space-y-2 overflow-y-auto rounded-lg border border-neutral-200 bg-white px-3 py-2 text-xs text-neutral-700">
-                          {visitedUrls.map((url) => (
-                            <li key={url} className="flex items-start justify-between gap-3">
-                              <a
-                                href={url}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="min-w-0 truncate text-neutral-700 underline decoration-neutral-300 underline-offset-4 hover:text-neutral-900"
-                              >
-                                {url}
-                              </a>
-                              {isPdfUrl(url) && (
-                                <Badge variant="outline" className="whitespace-nowrap">
-                                  PDF
-                                </Badge>
-                              )}
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-                    {job.url_timings && job.url_timings.length > 0 && (
-                      <div className="mt-4 space-y-2">
-                        <p className="text-[11px] uppercase tracking-wide text-neutral-500">
-                          Per-fund timing
-                        </p>
-                        <ul className="space-y-2 text-sm text-neutral-800">
-                          {job.url_timings
-                            .slice(-5)
-                            .reverse()
-                            .map((t) => (
-                              <li
-                                key={`${t.url}-${t.finished_at || t.started_at || Math.random()}`}
-                                className="flex items-center justify-between rounded-lg border border-neutral-200 bg-white px-3 py-2"
-                              >
-                                <div className="min-w-0">
-                                  <p className="truncate font-semibold text-neutral-900">{t.url}</p>
-                                  <p className="text-xs text-neutral-600">
-                                    {t.error ? `Error: ${t.error}` : "Completed"}
-                                  </p>
-                                </div>
-                                <Badge variant="muted" className="whitespace-nowrap">
-                                  {formatSeconds(t.duration_seconds || 0)}
-                                </Badge>
-                              </li>
-                            ))}
-                        </ul>
-                      </div>
-                    )}
-                  </>
-                );
-              })()}
+                  </summary>
+                  <ul className="space-y-1 px-3 pb-3 pt-1">
+                    {job.errors.map((err) => (
+                      <li key={err.url} className="text-xs text-red-600">
+                        <span className="font-medium">{err.url}:</span> {err.message}
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              )}
+
+              {job.results.length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Latest results</p>
+                  <ul className="space-y-1.5">
+                    {job.results.slice(-5).reverse().map((res) => (
+                      <li key={`${res.fund_url}-${res.fund_name}`} className="flex items-center justify-between gap-3 rounded-lg border border-slate-100 bg-white px-3 py-2">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-medium text-slate-800">{res.fund_name || res.fund_url}</p>
+                          <p className="truncate text-xs text-slate-400">{res.fund_url}</p>
+                        </div>
+                        <Badge variant={eligibilityVariantMap[res.eligibility] ?? "muted"} className="shrink-0">
+                          {res.eligibility || "Pending"}
+                        </Badge>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {job.url_timings && job.url_timings.length > 0 && (
+                <details className="rounded-lg border border-slate-200">
+                  <summary className="cursor-pointer px-3 py-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                    Per-fund timing
+                  </summary>
+                  <ul className="space-y-1.5 px-3 pb-3 pt-1">
+                    {job.url_timings.slice(-5).reverse().map((t) => (
+                      <li key={`${t.url}-${t.finished_at ?? t.started_at}`} className="flex items-center justify-between gap-3 rounded-lg bg-white border border-slate-100 px-3 py-2">
+                        <div className="min-w-0">
+                          <p className="truncate text-xs font-medium text-slate-700">{t.url}</p>
+                          {t.error && <p className="text-xs text-red-500">{t.error}</p>}
+                        </div>
+                        <span className="stat-pill shrink-0">{formatSeconds(t.duration_seconds || 0)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              )}
             </div>
           )}
-        </CardContent>
-      </Card>
+        </div>
+      </div>
     </div>
   );
 }
 
 function safeDomain(url: string): string {
-  try {
-    return new URL(url).hostname || "unknown";
-  } catch {
-    return "unknown";
-  }
+  try { return new URL(url).hostname || "unknown"; } catch { return "unknown"; }
 }
 
-function isPdfRead(value: any) {
+function isPdfRead(value: any): boolean {
   if (value === true) return true;
   if (typeof value === "number") return value > 0;
-  if (typeof value === "string") {
-    const normalized = value.trim().toLowerCase();
-    return ["true", "yes", "1", "y"].includes(normalized);
-  }
+  if (typeof value === "string") return ["true", "yes", "1", "y"].includes(value.trim().toLowerCase());
   return false;
 }
 
 function calcQueueStats(urls: string[]): QueueStats {
   const domains = new Set<string>();
-  urls.forEach((u) => {
-    const d = safeDomain(u);
-    if (d !== "unknown") domains.add(d);
-  });
+  urls.forEach((u) => { const d = safeDomain(u); if (d !== "unknown") domains.add(d); });
   return { uniqueDomains: domains.size, totalQueued: urls.length };
 }
 
@@ -657,15 +554,6 @@ function formatSeconds(totalSeconds: number): string {
   const hours = Math.floor(s / 3600);
   const minutes = Math.floor((s % 3600) / 60);
   const seconds = s % 60;
-  const parts = [
-    hours > 0 ? `${hours}h` : null,
-    minutes > 0 ? `${minutes}m` : null,
-    `${seconds}s`,
-  ].filter(Boolean);
-  return parts.join(" ");
-}
-
-function isPdfUrl(url: string): boolean {
-  const lowered = url.toLowerCase();
-  return lowered.endsWith(".pdf") || lowered.includes("accounts-resource");
+  return [hours > 0 ? `${hours}h` : null, minutes > 0 ? `${minutes}m` : null, `${seconds}s`]
+    .filter(Boolean).join(" ");
 }
