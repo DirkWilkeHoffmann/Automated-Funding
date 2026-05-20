@@ -17,9 +17,9 @@ async function request<T = any>(path: string, opts?: RequestOptions): Promise<T>
     ? { Authorization: `Bearer ${token}` }
     : {};
   const res = await fetch(`${API_BASE_URL}${path}`, {
+    ...rest,
     cache: "no-store",
     signal: AbortSignal.timeout(timeoutMs),
-    ...rest,
     headers: { "Content-Type": "application/json", ...authHeaders, ...(headers || {}) },
   });
   if (!res.ok) {
