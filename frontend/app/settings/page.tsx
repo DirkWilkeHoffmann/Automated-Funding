@@ -1,94 +1,73 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { api, API_BASE_URL } from "../../lib/api";
-import { Button } from "../../components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "../../components/ui/card";
-import { Input } from "../../components/ui/input";
-import { Label } from "../../components/ui/label";
-
-const LOCAL_OPENAI_KEY = "ellenor_openai_key";
+import Link from "next/link";
+import { ExternalLink, Info } from "lucide-react";
+import { API_BASE_URL } from "../../lib/api";
+import { useAuth } from "../../lib/auth";
 
 export default function SettingsPage() {
-  const [apiKey, setApiKey] = useState("");
-  const [sheetId] = useState("Managed on server");
-  const [apiBase] = useState(API_BASE_URL);
-  const [status, setStatus] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-
-  useEffect(() => {
-    const cached = localStorage.getItem(LOCAL_OPENAI_KEY);
-    if (cached) setApiKey(cached);
-  }, []);
-
-  const handleSave = async () => {
-    setStatus(null);
-    setError(null);
-    setSaving(true);
-    try {
-      await api.updateOpenAIKey(apiKey);
-      localStorage.setItem(LOCAL_OPENAI_KEY, apiKey);
-      setStatus("OpenAI key applied to the API for this session and saved in your browser.");
-    } catch (err: any) {
-      setError(err?.message || "Could not update OpenAI key.");
-    } finally {
-      setSaving(false);
-    }
-  };
+  const { user } = useAuth();
 
   return (
-    <div className="space-y-6">
+    <div className="page-content space-y-6">
       <header>
-        <p className="text-sm uppercase tracking-wide text-neutral-500">Settings</p>
-        <h1 className="text-3xl font-bold text-neutral-950">API & storage configuration</h1>
-        <p className="text-sm text-neutral-600">
-          Google Sheets credentials stay on the server. Use this page to change the OpenAI API key
-          without touching Azure secrets.
-        </p>
+        <p className="text-xs font-medium uppercase tracking-widest text-slate-400">Settings</p>
+        <h1 className="mt-0.5 text-2xl font-bold text-slate-900">Configuration</h1>
       </header>
-      <Card>
-        <CardHeader>
-          <CardTitle>OpenAI runtime key</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-2">
-              <Label htmlFor="api-key">OpenAI API Key</Label>
-              <Input
-                id="api-key"
-                type="password"
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder="sk-..."
-                autoComplete="off"
-              />
-              <p className="text-xs text-neutral-500">
-                Stored locally in this browser and pushed to the API for the current session only.
-              </p>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="sheet-id">Google Sheet ID</Label>
-              <Input id="sheet-id" value={sheetId} disabled className="text-neutral-500" />
-              <p className="text-xs text-neutral-500">
-                Managed server-side with the service account and not editable here.
-              </p>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="api-base">API base URL</Label>
-              <Input id="api-base" value={apiBase} disabled className="text-neutral-500" />
-              <p className="text-xs text-neutral-500">
-                Change with NEXT_PUBLIC_API_BASE_URL in your environment.
-              </p>
-            </div>
+
+      {/* API connection */}
+      <div className="card-base divide-y divide-slate-100 overflow-hidden">
+        <div className="px-5 py-4">
+          <p className="text-xs font-bold uppercase tracking-wider text-slate-400">API connection</p>
+        </div>
+        <div className="space-y-3 px-5 py-4">
+          <div className="space-y-1.5">
+            <label htmlFor="api-base" className="text-xs font-semibold text-slate-600">
+              API base URL
+            </label>
+            <input
+              id="api-base"
+              value={API_BASE_URL}
+              disabled
+              className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-500 shadow-sm"
+            />
           </div>
-          <Button className="mt-2" onClick={handleSave} disabled={saving || !apiKey.trim()}>
-            {saving ? "Saving..." : "Apply to API"}
-          </Button>
-          {status && <p className="text-sm text-neutral-600">{status}</p>}
-          {error && <p className="text-sm text-red-600">{error}</p>}
-        </CardContent>
-      </Card>
+          <p className="flex items-center gap-1.5 text-xs text-slate-500">
+            <Info size={12} className="shrink-0" />
+            Set with <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-slate-700">NEXT_PUBLIC_API_BASE_URL</code> in your environment.
+          </p>
+        </div>
+      </div>
+
+      {/* Account */}
+      <div className="card-base divide-y divide-slate-100 overflow-hidden">
+        <div className="px-5 py-4">
+          <p className="text-xs font-bold uppercase tracking-wider text-slate-400">Account</p>
+        </div>
+        <div className="space-y-3 px-5 py-4">
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-slate-600">Signed in as</label>
+            <input
+              value={user?.email ?? "—"}
+              disabled
+              className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-500 shadow-sm"
+            />
+          </div>
+        </div>
+        <div className="px-5 py-4">
+          <p className="flex items-center gap-1.5 text-sm text-slate-600">
+            OpenAI key, user roles, and org profile are managed in the{" "}
+            <Link
+              href="/admin"
+              className="inline-flex items-center gap-1 text-brand hover:underline"
+            >
+              Admin panel
+              <ExternalLink size={12} />
+            </Link>{" "}
+            (superusers only).
+          </p>
+        </div>
+      </div>
     </div>
   );
 }

@@ -1,10 +1,10 @@
 """Scraping-related constants."""
 
-HEADERS = {"User-Agent": "ellenor-funding-bot/priority/1.0 (+https://ellenor.org)"}
+HEADERS = {"User-Agent": "automated-funding-bot/1.0"}
 
 DISCOVERY_DEPTH = 2
-MAX_PAGES = 15
-MAX_DISCOVERY_PAGES = 100
+MAX_PAGES = 10
+MAX_DISCOVERY_PAGES = 40
 PAUSE_BETWEEN_REQUESTS = 1.0
 
 KEYWORDS = [

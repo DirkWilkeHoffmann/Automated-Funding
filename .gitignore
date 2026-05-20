@@ -82,3 +82,15 @@ docker-compose.override.yml
 .cache/
 .tmp/
 temp/
+
+# Runtime / vector DBs
+ruvector.db
+agentdb.rvf
+agentdb.rvf.lock
+
+# Data and archives
+Scraped/
+_archive/
+
+# Broken environments
+.venv-broken/

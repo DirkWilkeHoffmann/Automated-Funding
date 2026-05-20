@@ -1,26 +1,24 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import "./globals.css";
-import Sidebar from "../components/Sidebar";
-import PasswordGate from "../components/PasswordGate";
+import ClientLayout from "../components/ClientLayout";
 
-const inter = Inter({ subsets: ["latin"] });
+const inter = Inter({
+  subsets: ["latin"],
+  variable: "--font-inter",
+  display: "swap",
+});
 
 export const metadata: Metadata = {
-  title: "Ellenor Funding",
-  description: "Scrape and analyze charity funding opportunities",
+  title: "Automated Funding",
+  description: "Discover and track US grant funding opportunities",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
-      <body className={`${inter.className} min-h-screen bg-slate-50`}>
-        <PasswordGate>
-          <div className="flex min-h-screen">
-            <Sidebar />
-            <main className="flex-1 overflow-y-auto bg-white p-8 shadow-inner">{children}</main>
-          </div>
-        </PasswordGate>
+    <html lang="en" className={inter.variable}>
+      <body className="min-h-screen bg-slate-50 font-sans antialiased">
+        <ClientLayout>{children}</ClientLayout>
       </body>
     </html>
   );

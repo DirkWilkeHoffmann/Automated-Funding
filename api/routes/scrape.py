@@ -64,6 +64,7 @@ def _prepare_urls_for_scrape(
 def prepare_urls(
     payload: PrepareUrlsRequest,
     tools_module: tools = Depends(dependencies.get_tools_module),
+    _user=Depends(dependencies.require_user),
 ) -> PrepareUrlsResponse:
     prepared = _prepare_urls_for_scrape(
         [str(url) for url in payload.fund_urls], tools_module=tools_module
@@ -75,6 +76,7 @@ def prepare_urls(
 def scrape_single(
     payload: ScrapeRequest,
     tools_module: tools = Depends(dependencies.get_tools_module),
+    _user=Depends(dependencies.require_user),
 ) -> ScrapeResponse:
     prepared = _prepare_urls_for_scrape([str(payload.fund_url)], tools_module=tools_module)
     if not prepared["to_scrape"]:
@@ -100,6 +102,7 @@ def scrape_single(
 def scrape_batch(
     payload: BatchScrapeRequest,
     tools_module: tools = Depends(dependencies.get_tools_module),
+    _user=Depends(dependencies.require_user),
 ) -> JobCreatedResponse:
     if not payload.fund_urls and not payload.rescrape_urls:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No URLs provided")
@@ -131,8 +134,17 @@ def scrape_batch(
     )
 
 
+@router.post("/jobs/{job_id}/cancel", status_code=status.HTTP_200_OK)
+def cancel_job(job_id: str, _user=Depends(dependencies.require_user)):
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    job.cancel()
+    return {"status": "cancelled", "job_id": job_id}
+
+
 @router.get("/jobs/{job_id}", response_model=JobStatusResponse)
-def job_status(job_id: str):
+def job_status(job_id: str, _user=Depends(dependencies.require_user)):
     job = job_store.get(job_id)
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")

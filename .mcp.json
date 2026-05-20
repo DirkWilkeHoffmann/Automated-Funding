@@ -1,10 +1,8 @@
 {
   "mcpServers": {
     "ruflo": {
-      "command": "npx",
+      "command": "ruflo",
       "args": [
-        "-y",
-        "ruflo@latest",
         "mcp",
         "start"
       ],

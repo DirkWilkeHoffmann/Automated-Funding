@@ -109,3 +109,119 @@ class UpdateOpenAIKeyRequest(BaseModel):
 class UpdateOpenAIKeyResponse(BaseModel):
     status: str = "ok"
     openai_api_key_set: bool = True
+
+
+# ── Admin schemas ────────────────────────────────────────────────────────────
+
+
+class OrgProfileRequest(BaseModel):
+    name: Optional[str] = None
+    ein: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    mission: Optional[str] = None
+    services: Optional[List[str]] = None
+    annual_income: Optional[int] = None
+    staff_count: Optional[int] = None
+    volunteer_count: Optional[int] = None
+    website: Optional[str] = None
+    ai_system_prompt: Optional[str] = None
+    ai_user_prompt: Optional[str] = None
+
+
+class OrgProfileResponse(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    ein: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    mission: Optional[str] = None
+    services: Optional[List[str]] = None
+    annual_income: Optional[int] = None
+    staff_count: Optional[int] = None
+    volunteer_count: Optional[int] = None
+    website: Optional[str] = None
+    ai_system_prompt: Optional[str] = None
+    ai_user_prompt: Optional[str] = None
+
+
+class UserRecord(BaseModel):
+    id: str
+    email: Optional[str] = None
+    role: str = "user"
+    created_at: Optional[str] = None
+
+
+class UserRoleRequest(BaseModel):
+    role: Literal["user", "superuser"]
+
+
+class CreateUserRequest(BaseModel):
+    email: str
+    password: str
+    role: Literal["user", "superuser"] = "user"
+
+
+class CreateUserResponse(BaseModel):
+    id: str
+    email: str
+    role: str
+
+
+class SetOpenAIKeyRequest(BaseModel):
+    openai_api_key: str
+
+
+class TokenStatusResponse(BaseModel):
+    name: str
+    masked: str
+    updated_at: Optional[str] = None
+
+
+# ── Discovery schemas ────────────────────────────────────────────────────────
+
+
+class DiscoverySourcesConfig(BaseModel):
+    propublica: bool = True
+    grants_gov: bool = True
+    sam_gov: bool = False
+    web_search: bool = True
+    federal_register: bool = True
+
+
+class DiscoveryConfigRequest(BaseModel):
+    enabled: bool = False
+    cron_expression: str = "0 2 * * 1"
+    states: List[str] = Field(default_factory=list)
+    keywords: List[str] = Field(default_factory=list)
+    sources: DiscoverySourcesConfig = Field(default_factory=DiscoverySourcesConfig)
+    max_per_source: int = Field(default=100, ge=10, le=500)
+
+
+class DiscoveryConfigResponse(DiscoveryConfigRequest):
+    id: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class DiscoveryRunResponse(BaseModel):
+    id: str
+    started_at: str
+    finished_at: Optional[str] = None
+    status: str
+    trigger: str
+    urls_discovered: int = 0
+    urls_new: int = 0
+    scrape_job_id: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+class SetSamGovKeyRequest(BaseModel):
+    sam_gov_api_key: str
+
+
+class SetBraveSearchKeyRequest(BaseModel):
+    brave_search_api_key: str
+
+
+class BulkDeleteRequest(BaseModel):
+    urls: List[str]

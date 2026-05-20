@@ -11,11 +11,9 @@ router = APIRouter(prefix="/settings", tags=["settings"])
 def update_openai_key(
     payload: UpdateOpenAIKeyRequest,
     tools_module: tools = Depends(dependencies.get_tools_module),
+    _user=Depends(dependencies.require_superuser),
 ) -> UpdateOpenAIKeyResponse:
-    """
-    Override the OpenAI API key for the current runtime session.
-    Service account and sheet ID remain server-managed.
-    """
+    """Override the OpenAI API key for the current runtime session (superuser only)."""
     key = (payload.openai_api_key or "").strip()
     dependencies.settings.openai_api_key = key
     tools_module.configure_tools(openai_api_key=key)

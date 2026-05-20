@@ -9,8 +9,8 @@ class ToolSettings:
     """Runtime configuration for scraping tools."""
 
     openai_api_key: Optional[str] = None
-    google_service_account: Optional[dict] = None
-    google_sheet_id: Optional[str] = None
+    supabase_url: Optional[str] = None
+    supabase_service_key: Optional[str] = None
     log_callback: Optional[Callable[[str, str], None]] = None
 
 
@@ -27,3 +27,4 @@ class ScrapeProgress:
     current_url: Optional[str] = None
     current_started_at: Optional[float] = None
     url_timings: List[Dict[str, Any]] = field(default_factory=list)
+    cancelled: bool = False

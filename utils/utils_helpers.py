@@ -14,14 +14,13 @@ logger = logging.getLogger(__name__)
 
 def log_message(message: str, level: str = "info") -> None:
     """Write to the configured callback and fall back to logging."""
-
     settings = get_settings()
     callback = settings.log_callback
     if callback:
         try:
             callback(level, message)
             return
-        except Exception:  # pragma: no cover - defensive
+        except Exception:
             logger.exception("Log callback failed")
 
     log_fn = getattr(logger, level, None)
@@ -53,11 +52,7 @@ def normalize_url(url: str) -> str:
 def initial_normalize_url(url: str) -> str:
     """
     For initial seed URLs (user-provided), produce a base link to restrict crawling.
-
-    Example:
-        https://register-of-charities.charitycommission.gov.uk/...?query=params
-        becomes
-        https://register-of-charities.charitycommission.gov.uk/en/charity-search/-/charity-details/1010625
+    Strips query params so the crawl stays within the funder's own content tree.
     """
     url = url.strip()
     if not url:
@@ -69,19 +64,11 @@ def initial_normalize_url(url: str) -> str:
     path = parsed.path or "/"
     path = re.sub(r"/+$", "", path)
 
-    # special case: Charity Commission pattern
-    if "charitycommission.gov.uk" in netloc and "/charity-details/" in path:
-        # keep only the ID part
-        match = re.search(r"(/charity-details/\d+)", path)
-        if match:
-            path = "/en/charity-search/-" + match.group(1)
-
-    normalized = f"{scheme}://{netloc}{path}"
-    return normalized
+    return f"{scheme}://{netloc}{path}"
 
 
 def parse_extraction_timestamp(value: Any) -> Optional[datetime]:
-    """Parse extraction_timestamp values from Google Sheets into datetimes."""
+    """Parse extraction_timestamp values into datetimes."""
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -102,8 +89,7 @@ def parse_extraction_timestamp(value: Any) -> Optional[datetime]:
             return datetime.strptime(text, fmt)
         except ValueError:
             continue
-    # Handle malformed timestamps like "2025-11-20 11:33:60" by rolling
-    # overflow seconds forward from the minute boundary.
+    # Handle malformed timestamps like "2025-11-20 11:33:60" by rolling overflow seconds forward.
     overflow_match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2}):(\d+)", text)
     if overflow_match:
         date_part, hour_part, minute_part, second_part = overflow_match.groups()
@@ -131,42 +117,15 @@ def subtract_months(source: datetime, months: int) -> datetime:
 
 
 def canon_funder_url(url: str) -> str:
-    """
-    Canonical funder URL.
-
-    Special rule:
-    - For Charity Commission register URLs:
-      Must match EXACT FULL URL (after basic normalization).
-    - Otherwise:
-      Canonicalize to base domain only.
-    """
+    """Canonical funder URL — returns the base domain."""
     if not url:
         return ""
-
     try:
         u = normalize_url(url)
-        parts = urlparse(u)
-        domain = parts.netloc.lower().replace("www.", "")
-
-        # SPECIAL CASE: Charity Commission Register
-        if domain.startswith("register-of-charities.charitycommission"):
-            # exact match, no simplification
-            return u.rstrip("/")
-
-        # DEFAULT: return only the domain
+        domain = urlparse(u).netloc.lower().replace("www.", "")
         return f"https://{domain}"
-
     except Exception:
         return url.strip().lower()
-
-
-def is_charity_commission_url(url: str) -> bool:
-    """Check if URL is from Charity Commission."""
-    try:
-        netloc = urlparse(url).netloc.lower()
-    except Exception:
-        return False
-    return "register-of-charities.charitycommission.gov.uk" in netloc
 
 
 def folder_name_for_url(u: str) -> str:

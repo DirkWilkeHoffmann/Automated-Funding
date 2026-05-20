@@ -10,7 +10,11 @@ from typing import Callable, Set
 import pandas as pd
 
 from utils.constants import CSV_COLUMNS, SAVE_DIR
-from utils.google_sheets import _get_sheet
+from utils.db.funds_store import (
+    clear_funds_cache,
+    get_processed_urls,
+    load_funds,
+)
 from utils.utils_helpers import (
     canon_funder_url,
     log_message,
@@ -22,66 +26,19 @@ from utils.utils_helpers import (
 logger = logging.getLogger(__name__)
 
 
-@lru_cache(maxsize=1)
-def _load_results_csv_cached() -> pd.DataFrame:
-    """Internal cached loader used by load_results_csv()."""
-    try:
-        ws = _get_sheet()
-        values = ws.get_all_values()
-        if not values:
-            return pd.DataFrame(columns=CSV_COLUMNS)
-
-        header = values[0]
-        rows = values[1:]
-
-        df = pd.DataFrame(rows, columns=header)
-    except Exception as exc:
-        from utils.config import get_settings
-
-        log_message(f"Error loading from Google Sheet: {exc}", "error")
-        log_message(
-            "Google service account summary: " + f"{get_settings().google_service_account}",
-            "debug",
-        )
-        df = pd.DataFrame(columns=CSV_COLUMNS)
-
-    for col in CSV_COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
-
-    return df[CSV_COLUMNS]
-
-
 def load_results_csv(force_refresh: bool = False) -> pd.DataFrame:
-    """
-    Load results from Google Sheets (persistent).
-    Returns a defensive copy so callers can modify freely.
-    """
-    if force_refresh:
-        _load_results_csv_cached.cache_clear()
-    return _load_results_csv_cached().copy()
+    """Load all fund results from Supabase. Returns a defensive copy."""
+    return load_funds(force_refresh=force_refresh)
 
 
 def clear_results_cache() -> None:
-    """Clear cached Google Sheet results."""
-    _load_results_csv_cached.cache_clear()
-    _get_already_processed_urls_cached.cache_clear()
-
-
-@lru_cache(maxsize=1)
-def _get_already_processed_urls_cached() -> Set[str]:
-    """Internal cached lookup of already-processed URLs."""
-    df = load_results_csv()
-    if "fund_url" in df.columns:
-        return {normalize_url(u) for u in df["fund_url"].dropna().astype(str).tolist()}
-    return set()
+    """Invalidate cached fund results."""
+    clear_funds_cache()
 
 
 def get_already_processed_urls(force_refresh: bool = False) -> Set[str]:
-    """Get the set of already-processed fund URLs."""
-    if force_refresh:
-        clear_results_cache()
-    return set(_get_already_processed_urls_cached())
+    """Get the set of already-processed (normalized) fund URLs."""
+    return get_processed_urls(force_refresh=force_refresh)
 
 
 @lru_cache(maxsize=4)

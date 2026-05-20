@@ -1,6 +1,6 @@
 """Re-export all constants for backwards compatibility."""
 
-from utils.constants.llm import ELIGIBILITY_ORDER, LLM_PROMPT
+from utils.constants.llm import ELIGIBILITY_ORDER, LLM_PROMPT, LLM_SYSTEM_PROMPT
 from utils.constants.scraping import (
     DISCOVERY_DEPTH,
     HEADERS,
@@ -20,6 +20,7 @@ __all__ = [
     "HEADERS",
     "ELIGIBILITY_ORDER",
     "LLM_PROMPT",
+    "LLM_SYSTEM_PROMPT",
     "CSV_COLUMNS",
     "KEYWORDS",
 ]

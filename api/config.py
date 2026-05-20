@@ -2,24 +2,23 @@
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Optional
 
 
 @dataclass(slots=True)
 class AppConfig:
     openai_api_key: Optional[str]
-    google_sheet_id: Optional[str]
-    gcp_service_account: Optional[Dict[str, Any]]
-    log_level: str = "DEBUG"
+    supabase_url: str
+    supabase_service_key: str
+    log_level: str = "INFO"
 
     @classmethod
     def load(cls) -> "AppConfig":
         """Load configuration from environment variables."""
 
-        def _clean_env_value(value: Optional[str]) -> Optional[str]:
+        def _clean(value: Optional[str]) -> Optional[str]:
             if value is None:
                 return None
             cleaned = value.strip()
@@ -27,45 +26,18 @@ class AppConfig:
                 cleaned = cleaned[1:-1].strip()
             return cleaned or None
 
-        def _parse_service_account_json(value: str, env_name: str) -> Dict[str, Any]:
-            try:
-                parsed = json.loads(value)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"{env_name} is set but does not contain valid JSON. "
-                    "Provide the full JSON string for the Google service account."
-                ) from exc
-            if not isinstance(parsed, dict):
-                raise ValueError(f"{env_name} must contain a JSON object.")
-            return parsed
+        supabase_url = (_clean(os.getenv("SUPABASE_URL")) or "").strip()
+        supabase_service_key = (_clean(os.getenv("SUPABASE_SERVICE_KEY")) or "").strip()
 
-        raw_sa = (os.getenv("GCP_SERVICE_ACCOUNT_JSON") or "").strip()
-        sa_file = _clean_env_value(os.getenv("GCP_SERVICE_ACCOUNT_FILE")) or ""
-        service_account: Optional[Dict[str, Any]] = None
-
-        if raw_sa:
-            service_account = _parse_service_account_json(raw_sa, "GCP_SERVICE_ACCOUNT_JSON")
-        elif sa_file:
-            if sa_file.lstrip().startswith("{"):
-                service_account = _parse_service_account_json(sa_file, "GCP_SERVICE_ACCOUNT_FILE")
-            else:
-                if not os.path.exists(sa_file):
-                    raise FileNotFoundError(
-                        f"GCP_SERVICE_ACCOUNT_FILE is set to '{sa_file}' but the file was not found."
-                    )
-                with open(sa_file, "r", encoding="utf-8") as fh:
-                    service_account = json.load(fh)
-
-        if service_account is None:
-            raise ValueError(
-                "Google service account credentials not provided. "
-                "Set GCP_SERVICE_ACCOUNT_JSON (full JSON string) or GCP_SERVICE_ACCOUNT_FILE (path to JSON)."
-            )
+        if not supabase_url:
+            raise ValueError("SUPABASE_URL environment variable is required.")
+        if not supabase_service_key:
+            raise ValueError("SUPABASE_SERVICE_KEY environment variable is required.")
 
         return cls(
-            openai_api_key=_clean_env_value(os.getenv("OPENAI_API_KEY")),
-            google_sheet_id=_clean_env_value(os.getenv("GOOGLE_SHEET_ID")),
-            gcp_service_account=service_account,
+            openai_api_key=_clean(os.getenv("OPENAI_API_KEY")),
+            supabase_url=supabase_url,
+            supabase_service_key=supabase_service_key,
             log_level=os.getenv("LOG_LEVEL", "INFO"),
         )
 
