@@ -44,8 +44,10 @@ export default function TestPage() {
   async function runHealthCheck() {
     setHealthStatus("loading");
     setHealthBody(null);
+    const url = getApiBaseUrl();
+    const extraHeaders = url.includes("ngrok") ? { "ngrok-skip-browser-warning": "true" } : {};
     try {
-      const res = await fetch(`${getApiBaseUrl()}/health`, { cache: "no-store" });
+      const res = await fetch(`${url}/health`, { cache: "no-store", headers: extraHeaders });
       const text = await res.text();
       setHealthStatus(res.ok ? "ok" : "error");
       setHealthBody(text);

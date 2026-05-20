@@ -15,6 +15,10 @@ export function getApiBaseUrl(): string {
   return API_BASE_URL;
 }
 
+function ngrokHeaders(url: string): Record<string, string> {
+  return url.includes("ngrok") ? { "ngrok-skip-browser-warning": "true" } : {};
+}
+
 export function setApiOverride(url: string) {
   localStorage.setItem(DEV_OVERRIDE_KEY, url.replace(/\/$/, ""));
 }
@@ -34,11 +38,17 @@ async function request<T = any>(path: string, opts?: RequestOptions): Promise<T>
   const authHeaders: Record<string, string> = token
     ? { Authorization: `Bearer ${token}` }
     : {};
-  const res = await fetch(`${getApiBaseUrl()}${path}`, {
+  const baseUrl = getApiBaseUrl();
+  const res = await fetch(`${baseUrl}${path}`, {
     ...rest,
     cache: "no-store",
     signal: AbortSignal.timeout(timeoutMs),
-    headers: { "Content-Type": "application/json", ...authHeaders, ...(headers || {}) },
+    headers: {
+      "Content-Type": "application/json",
+      ...ngrokHeaders(baseUrl),
+      ...authHeaders,
+      ...(headers || {}),
+    },
   });
   if (!res.ok) {
     const text = await res.text();
