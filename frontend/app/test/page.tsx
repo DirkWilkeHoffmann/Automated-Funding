@@ -45,7 +45,7 @@ export default function TestPage() {
     setHealthStatus("loading");
     setHealthBody(null);
     const url = getApiBaseUrl();
-    const extraHeaders = url.includes("ngrok") ? { "ngrok-skip-browser-warning": "true" } : {};
+    const extraHeaders: Record<string, string> = url.includes("ngrok") ? { "ngrok-skip-browser-warning": "true" } : {};
     try {
       const res = await fetch(`${url}/health`, { cache: "no-store", headers: extraHeaders });
       const text = await res.text();
