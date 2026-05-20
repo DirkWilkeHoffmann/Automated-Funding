@@ -43,8 +43,8 @@ def get_org_profile_text() -> str:
         parts.append(f"Organization: {org['name']}")
     if org.get("ein"):
         parts.append(f"EIN: {org['ein']}")
-    city = org.get("city", "").strip()
-    state = org.get("state", "").strip()
+    city = (org.get("city") or "").strip()
+    state = (org.get("state") or "").strip()
     location = ", ".join(filter(None, [city, state]))
     if location:
         parts.append(f"Location: {location}")

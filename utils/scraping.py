@@ -40,7 +40,7 @@ def fetch_page(url: str, retries: int = 4, backoff_factor: int = 2) -> Optional[
         html, ts = cached
         if time.time() - ts < _CACHE_TTL:
             return html
-        del _html_cache[url]
+        _html_cache.pop(url, None)
 
     for attempt in range(retries):
         try:
