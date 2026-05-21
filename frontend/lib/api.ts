@@ -5,26 +5,8 @@ export const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE ||
   "https://automated-funding-api--0000001.ambitioussand-ae029d29.eastus.azurecontainerapps.io";
 
-const DEV_OVERRIDE_KEY = "dev_api_override";
-
-export function getApiBaseUrl(): string {
-  if (typeof window !== "undefined") {
-    const override = window.localStorage.getItem(DEV_OVERRIDE_KEY);
-    if (override) return override.replace(/\/$/, "");
-  }
-  return API_BASE_URL;
-}
-
 function ngrokHeaders(url: string): Record<string, string> {
   return url.includes("ngrok") ? { "ngrok-skip-browser-warning": "true" } : {};
-}
-
-export function setApiOverride(url: string) {
-  localStorage.setItem(DEV_OVERRIDE_KEY, url.replace(/\/$/, ""));
-}
-
-export function clearApiOverride() {
-  localStorage.removeItem(DEV_OVERRIDE_KEY);
 }
 
 type RequestOptions = RequestInit & {
@@ -38,7 +20,7 @@ async function request<T = any>(path: string, opts?: RequestOptions): Promise<T>
   const authHeaders: Record<string, string> = token
     ? { Authorization: `Bearer ${token}` }
     : {};
-  const baseUrl = getApiBaseUrl();
+  const baseUrl = API_BASE_URL;
   const res = await fetch(`${baseUrl}${path}`, {
     ...rest,
     cache: "no-store",
