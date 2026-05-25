@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Archive, Download, Star, Trash2 } from "lucide-react";
+import { Archive, Download, RotateCcw, Star, Trash2 } from "lucide-react";
 import { api } from "../../lib/api";
 import { clearCache, readCache, writeCache } from "../../lib/storage";
 import { Button } from "../ui/button";
@@ -221,6 +221,8 @@ export function ResultsLayout() {
   const [archivedUrls, setArchivedUrls] = useState<Set<string>>(new Set());
   const [showArchived, setShowArchived] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [rescrapeUrls, setRescrapeUrls] = useState<string[]>([]);
+  const [rescraping, setRescraping] = useState(false);
   const seenUrls = useRef<Set<string>>(new Set());
   const searchRef = useRef<HTMLInputElement>(null);
 
@@ -542,6 +544,39 @@ export function ResultsLayout() {
     }
   }, [checkedUrls, deleting]);
 
+  const handleRescrapeSelected = useCallback(() => {
+    if (checkedUrls.size === 0) return;
+    setRescrapeUrls(Array.from(checkedUrls));
+  }, [checkedUrls]);
+
+  const handleRescrapeSingle = useCallback((url: string) => {
+    setRescrapeUrls([url]);
+  }, []);
+
+  const handleRescrapeConfirm = useCallback(async () => {
+    if (rescraping || rescrapeUrls.length === 0) return;
+    setRescraping(true);
+    const urls = rescrapeUrls;
+    try {
+      await api.deleteResults(urls);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Delete failed");
+      setRescraping(false);
+      return;
+    }
+    // Delete succeeded — update local state immediately
+    setData((prev) => prev.filter((row) => !urls.includes(row.fund_url || "")));
+    setCheckedUrls(new Set());
+    setRescrapeUrls([]);
+    try {
+      await api.scrapeBatch([], urls, { rescrapeScope: "any" });
+    } catch {
+      setError("Deleted but scrape failed to queue — use the Scrape page to re-add these URLs manually.");
+    } finally {
+      setRescraping(false);
+    }
+  }, [rescraping, rescrapeUrls]);
+
   const handleDownload = useCallback(() => {
     if (visibleResults.length === 0) return;
     const csv = buildCsv(visibleResults, exportColumns);
@@ -621,6 +656,39 @@ export function ResultsLayout() {
               <Button variant="ghost" size="sm" onClick={handleDeleteSelected} disabled={deleting} className="h-7 gap-1.5 px-2 text-xs text-red-600 hover:bg-red-50">
                 <Trash2 size={12} />{deleting ? "Deleting…" : "Delete"}
               </Button>
+              <Button variant="ghost" size="sm" onClick={handleRescrapeSelected} disabled={rescraping} className="h-7 gap-1.5 px-2 text-xs font-semibold text-indigo-600 hover:bg-indigo-50">
+                <RotateCcw size={12} />Rescrape
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Rescrape confirmation banner */}
+        {rescrapeUrls.length > 0 && (
+          <div className="flex flex-wrap items-center gap-3 border-b border-slate-800 bg-slate-900 px-4 py-3">
+            <RotateCcw size={14} className="shrink-0 text-indigo-400" />
+            <p className="flex-1 text-xs text-slate-200">
+              <span className="font-semibold text-white">
+                Delete {rescrapeUrls.length} result{rescrapeUrls.length > 1 ? "s" : ""} and queue a fresh scrape?
+              </span>{" "}
+              Current data is removed and these URLs are re-analysed from scratch. This cannot be undone.
+            </p>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setRescrapeUrls([])}
+                className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-700"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleRescrapeConfirm}
+                disabled={rescraping}
+                className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-500 disabled:opacity-60"
+              >
+                {rescraping ? "Rescraping…" : "Confirm & Rescrape"}
+              </button>
             </div>
           </div>
         )}
@@ -673,6 +741,7 @@ export function ResultsLayout() {
           allChecked={allChecked}
           onToggleCheck={toggleCheck}
           onToggleCheckAll={toggleCheckAll}
+          onRescrape={handleRescrapeSingle}
         />
       </div>
     </div>

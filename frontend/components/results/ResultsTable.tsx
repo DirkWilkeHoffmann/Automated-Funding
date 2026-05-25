@@ -2,7 +2,7 @@
 
 import type { ReactNode } from "react";
 import { Fragment } from "react";
-import { ChevronDown, ChevronRight, Inbox, Pin, PinOff, SearchX } from "lucide-react";
+import { ChevronDown, ChevronRight, Inbox, Pin, PinOff, RotateCcw, SearchX } from "lucide-react";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Skeleton } from "../ui/skeleton";
@@ -39,25 +39,9 @@ interface ResultsTableProps {
   allChecked?: boolean;
   onToggleCheck?: (url: string) => void;
   onToggleCheckAll?: () => void;
+  onRescrape?: (url: string) => void;
 }
 
-
-const DETAIL_SECTIONS: Record<string, string[]> = {
-  "Funding Details": ["funding_range", "application_status", "deadline", "restrictions", "notes"],
-  Eligibility: ["eligibility", "eligibility_reason", "evidence"],
-  "Scope & Audience": ["applicant_types", "geographic_scope", "beneficiary_focus"],
-  "Source & Technical": [
-    "pages_scraped",
-    "visited_urls_count",
-    "pdf_read",
-    "pdf_pages",
-    "pdf_url",
-    "extraction_timestamp",
-    "error",
-    "source_folder",
-    "Processed",
-  ],
-};
 
 function highlightText(value: any, query: string): ReactNode {
   const text = normalizeText(value);
@@ -85,6 +69,17 @@ function normalizeText(val: any): string {
 
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function getDeadlineClass(deadline: string | null | undefined): string {
+  if (!deadline) return "text-slate-300";
+  const t = new Date(deadline).getTime();
+  if (isNaN(t)) return "text-slate-700";
+  const daysUntil = (t - Date.now()) / (1000 * 60 * 60 * 24);
+  if (daysUntil < 0) return "text-red-400 line-through";
+  if (daysUntil < 14) return "text-red-600 font-bold";
+  if (daysUntil < 60) return "text-amber-600 font-semibold";
+  return "text-emerald-600 font-semibold";
 }
 
 function formatValue(val: any): string {
@@ -195,6 +190,7 @@ export function ResultsTable({
   allChecked = false,
   onToggleCheck,
   onToggleCheckAll,
+  onRescrape,
 }: ResultsTableProps) {
   if (loading) return <ResultsTableSkeleton />;
 
@@ -297,23 +293,7 @@ export function ResultsTable({
               const isExpanded = expandedRows.has(rowKey) || isPinned;
               const isNew = newResultKeys.has(rowKey);
 
-              // Group fields into sections for expanded view
-              const fieldsBySection: Record<string, typeof detailFields> = {};
-              const ungrouped: typeof detailFields = [];
-              detailFields.forEach((field) => {
-                let found = false;
-                for (const [sectionName, accessors] of Object.entries(DETAIL_SECTIONS)) {
-                  if (accessors.includes(field.accessor)) {
-                    if (!fieldsBySection[sectionName]) fieldsBySection[sectionName] = [];
-                    fieldsBySection[sectionName].push(field);
-                    found = true;
-                    break;
-                  }
-                }
-                if (!found) ungrouped.push(field);
-              });
-
-              const rowUrl = row.fund_url || "";
+const rowUrl = row.fund_url || "";
               const isChecked = checkedUrls.has(rowUrl);
               const isStarred = starredUrls.has(rowUrl);
 
@@ -447,12 +427,10 @@ export function ResultsTable({
 
                   {/* Expanded detail view */}
                   {isExpanded && (
-                    <div className={cn(
-                      "px-4 pb-5 pt-2",
-                      isPinned ? "bg-brand-50/20" : "bg-slate-50/40"
-                    )}>
+                    <div className={cn("px-4 pb-5 pt-2", isPinned ? "bg-brand-50/20" : "bg-slate-50/40")}>
                       <div className="rounded-xl border border-slate-200 bg-white shadow-card overflow-hidden">
-                        {/* Expanded header */}
+
+                        {/* Header */}
                         <div className="flex items-start justify-between border-b border-slate-100 bg-slate-50/60 px-4 py-3">
                           <div className="min-w-0">
                             <p className="font-semibold text-slate-900">
@@ -473,6 +451,16 @@ export function ResultsTable({
                             <Badge variant={eligibilityVariantMap[row.eligibility] ?? "muted"}>
                               {row.eligibility || "Unknown"}
                             </Badge>
+                            {onRescrape && (
+                              <button
+                                type="button"
+                                onClick={() => onRescrape(rowUrl)}
+                                className="flex items-center gap-1.5 rounded-lg border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700 transition hover:bg-indigo-100"
+                              >
+                                <RotateCcw size={11} />
+                                Rescrape
+                              </button>
+                            )}
                             <button
                               type="button"
                               onClick={() => onTogglePin(rowKey)}
@@ -489,66 +477,156 @@ export function ResultsTable({
                           </div>
                         </div>
 
-                        {/* Sections */}
-                        <div className="grid gap-0 divide-y divide-slate-100 p-4 md:grid-cols-2 md:gap-4 md:divide-y-0 md:divide-x">
-                          {Object.entries(DETAIL_SECTIONS).map(([sectionName]) => {
-                            const sectionFields = fieldsBySection[sectionName];
-                            if (!sectionFields || sectionFields.length === 0) return null;
-                            return (
-                              <div key={sectionName} className="py-3 first:pt-0 last:pb-0 md:py-0 md:pr-4 md:last:pl-4 md:last:pr-0">
-                                <p className="mb-2.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                                  {sectionName}
-                                </p>
-                                <dl className="space-y-2">
-                                  {sectionFields.map((field) => {
-                                    const rawVal = field.formatter
-                                      ? field.formatter(row)
-                                      : formatValue(row[field.accessor]);
-                                    const isEmpty = !rawVal || rawVal === "-";
-                                    return (
-                                      <div key={field.accessor}>
-                                        <dt className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
-                                          {field.label}
-                                        </dt>
-                                        <dd className={cn(
-                                          "mt-0.5 whitespace-pre-wrap break-words text-xs",
-                                          isEmpty ? "text-slate-300" : "text-slate-800"
-                                        )}>
-                                          {isEmpty
-                                            ? "—"
-                                            : highlightText(rawVal, searchQuery)}
-                                        </dd>
-                                      </div>
-                                    );
-                                  })}
-                                </dl>
-                              </div>
-                            );
-                          })}
-                          {ungrouped.length > 0 && (
-                            <div className="py-3 md:py-0">
-                              <p className="mb-2.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                                Other
-                              </p>
-                              <dl className="space-y-2">
-                                {ungrouped.map((field) => {
-                                  const rawVal = field.formatter
-                                    ? field.formatter(row)
-                                    : formatValue(row[field.accessor]);
-                                  return (
-                                    <div key={field.accessor}>
-                                      <dt className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
-                                        {field.label}
-                                      </dt>
-                                      <dd className="mt-0.5 whitespace-pre-wrap break-words text-xs text-slate-800">
-                                        {highlightText(rawVal || "—", searchQuery)}
-                                      </dd>
-                                    </div>
-                                  );
-                                })}
-                              </dl>
+                        {/* 4-card body */}
+                        <div className="grid grid-cols-1 gap-3 p-4 md:grid-cols-2">
+
+                          {/* Funding card */}
+                          <div className="rounded-xl border border-slate-100 bg-slate-50/60 p-4">
+                            <div className="mb-3 flex items-center gap-2">
+                              <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-blue-50 text-sm">💰</div>
+                              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Funding</span>
                             </div>
-                          )}
+                            <dl className="space-y-2.5">
+                              <div>
+                                <dt className="text-[10px] text-slate-400">Amount</dt>
+                                <dd className={cn("mt-0.5 text-sm font-semibold",
+                                  row.funding_range && row.funding_range !== "Not stated" ? "text-emerald-600" : "text-slate-300")}>
+                                  {highlightText(row.funding_range || "Not stated", searchQuery)}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-[10px] text-slate-400">Deadline</dt>
+                                <dd className={cn("mt-0.5 text-sm", getDeadlineClass(row.deadline))}>
+                                  {highlightText(row.deadline || "—", searchQuery)}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-[10px] text-slate-400">Status</dt>
+                                <dd className="mt-0.5">
+                                  <Badge variant="muted">{row.application_status || "Unknown"}</Badge>
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-[10px] text-slate-400">Grant type</dt>
+                                <dd className="mt-0.5 text-xs capitalize text-slate-700">
+                                  {highlightText(row.grant_type || "—", searchQuery)}
+                                </dd>
+                              </div>
+                            </dl>
+                          </div>
+
+                          {/* Eligibility card */}
+                          <div className="rounded-xl border border-slate-100 bg-slate-50/60 p-4">
+                            <div className="mb-3 flex items-center gap-2">
+                              <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-green-50 text-sm">✓</div>
+                              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Eligibility</span>
+                            </div>
+                            <dl className="space-y-2.5">
+                              <div>
+                                <dt className="text-[10px] text-slate-400">Verdict</dt>
+                                <dd className="mt-0.5">
+                                  <Badge variant={eligibilityVariantMap[row.eligibility] ?? "muted"}>
+                                    {row.eligibility || "Unknown"}
+                                  </Badge>
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-[10px] text-slate-400">Applicant types</dt>
+                                <dd className="mt-1 flex flex-wrap gap-1">
+                                  {row.applicant_types
+                                    ? String(row.applicant_types).split(";").map((t: string, i: number) => (
+                                        <span key={`${t.trim()}-${i}`} className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] text-slate-600">
+                                          {highlightText(t.trim(), searchQuery)}
+                                        </span>
+                                      ))
+                                    : <span className="text-xs text-slate-300">—</span>}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-[10px] text-slate-400">Restrictions</dt>
+                                <dd className="mt-0.5 text-xs leading-relaxed text-slate-700">
+                                  {highlightText(row.restrictions || "—", searchQuery)}
+                                </dd>
+                              </div>
+                            </dl>
+                          </div>
+
+                          {/* Audience & Scope card */}
+                          <div className="rounded-xl border border-slate-100 bg-slate-50/60 p-4">
+                            <div className="mb-3 flex items-center gap-2">
+                              <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-purple-50 text-sm">👥</div>
+                              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Audience &amp; Scope</span>
+                            </div>
+                            <dl className="space-y-2.5">
+                              <div>
+                                <dt className="text-[10px] text-slate-400">Beneficiaries</dt>
+                                <dd className="mt-0.5 text-xs leading-relaxed text-slate-700">
+                                  {highlightText(row.beneficiary_focus || "—", searchQuery)}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-[10px] text-slate-400">Geography</dt>
+                                <dd className="mt-0.5 text-xs text-slate-700">
+                                  {highlightText(row.geographic_scope || "—", searchQuery)}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-[10px] text-slate-400">Notes</dt>
+                                <dd className="mt-0.5 text-xs leading-relaxed text-slate-700">
+                                  {highlightText(row.notes || "—", searchQuery)}
+                                </dd>
+                              </div>
+                            </dl>
+                          </div>
+
+                          {/* Evidence card */}
+                          <div className="rounded-xl border border-slate-100 bg-slate-50/60 p-4">
+                            <div className="mb-3 flex items-center gap-2">
+                              <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-orange-50 text-sm">📋</div>
+                              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Evidence</span>
+                            </div>
+                            {row.evidence
+                              ? <div className="rounded-lg border border-slate-100 bg-white p-3 text-xs leading-relaxed text-slate-600 whitespace-pre-wrap break-words">
+                                  {highlightText(row.evidence, searchQuery)}
+                                </div>
+                              : <p className="text-xs text-slate-300">No evidence recorded</p>
+                            }
+                          </div>
+
+                        </div>
+
+                        {/* Technical details — collapsed by default */}
+                        <div className="border-t border-slate-100">
+                          <details className="group">
+                            <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-[10px] font-semibold uppercase tracking-wider text-slate-400 hover:text-slate-600">
+                              <ChevronRight size={11} className="transition-transform group-open:rotate-90" aria-hidden="true" />
+                              Technical details
+                              <span className="ml-1 font-normal normal-case tracking-normal text-slate-300">
+                                pages scraped · PDF · timestamps
+                              </span>
+                            </summary>
+                            <div className="flex flex-wrap gap-6 px-4 pb-4 pt-1">
+                              {(
+                                [
+                                  { label: "Pages scraped", value: row.pages_scraped },
+                                  { label: "Visited URLs", value: row.visited_urls_count },
+                                  { label: "PDF read", value: row.pdf_read ? "Yes" : "No" },
+                                  { label: "PDF pages", value: row.pdf_pages },
+                                  ...(row.pdf_url ? [{ label: "PDF URL", value: row.pdf_url }] : []),
+                                  { label: "Scraped date", value: row.extraction_timestamp ? new Date(row.extraction_timestamp).toLocaleString() : "" },
+                                  ...(row.discovery_source ? [{ label: "Discovery source", value: row.discovery_source }] : []),
+                                  ...(row.error ? [{ label: "Error", value: row.error }] : []),
+                                ] as { label: string; value: unknown }[]
+                              )
+                                .filter((f) => f.value !== null && f.value !== undefined && f.value !== "")
+                                .map((f) => (
+                                  <div key={f.label} className="flex flex-col gap-0.5">
+                                    <span className="text-[9px] font-semibold uppercase tracking-wider text-slate-400">{f.label}</span>
+                                    <span className="text-[11px] text-slate-600">{String(f.value)}</span>
+                                  </div>
+                                ))}
+                            </div>
+                          </details>
                         </div>
 
                         {/* PDF text */}
@@ -556,10 +634,7 @@ export function ResultsTable({
                           <div className="border-t border-slate-100 px-4 pb-4 pt-3">
                             <details className="group">
                               <summary className="flex cursor-pointer list-none items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-slate-400 hover:text-slate-600">
-                                <ChevronRight
-                                  size={12}
-                                  className="transition-transform group-open:rotate-90"
-                                />
+                                <ChevronRight size={12} className="transition-transform group-open:rotate-90" aria-hidden="true" />
                                 PDF text
                               </summary>
                               <pre className="mt-2 max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded-lg bg-slate-50 p-3 text-xs text-slate-700">
@@ -569,11 +644,6 @@ export function ResultsTable({
                           </div>
                         )}
 
-                        {!showEvidence && (
-                          <div className="border-t border-slate-100 px-4 py-2 text-xs text-slate-400">
-                            Evidence hidden — press <kbd className="rounded bg-slate-100 px-1 py-0.5 font-mono text-slate-600">E</kbd> to show it
-                          </div>
-                        )}
                       </div>
                     </div>
                   )}
