@@ -11,6 +11,8 @@ from apscheduler.triggers.cron import CronTrigger
 logger = logging.getLogger(__name__)
 
 JOB_ID = "auto_discovery"
+BMF_IMPORT_JOB_ID = "bmf_import"
+GRANTS_GOV_IMPORT_JOB_ID = "grants_gov_import"
 
 _scheduler: Optional[BackgroundScheduler] = None
 
@@ -34,6 +36,24 @@ def _discovery_job() -> None:
         run_discovery(trigger="scheduled")
     except Exception as exc:
         logger.error("Scheduled discovery job raised: %s", exc, exc_info=True)
+
+
+def _bmf_import_job() -> None:
+    """Monthly IRS BMF import — runs 1st of month at 3am UTC."""
+    try:
+        from utils.discovery.importers.irs_bmf import run_bmf_import
+        run_bmf_import()
+    except Exception as exc:
+        logger.error("Scheduled BMF import raised: %s", exc, exc_info=True)
+
+
+def _grants_gov_import_job() -> None:
+    """Daily Grants.gov XML import — runs at 5am UTC."""
+    try:
+        from utils.discovery.importers.grants_gov_xml import run_grants_gov_import
+        run_grants_gov_import()
+    except Exception as exc:
+        logger.error("Scheduled Grants.gov import raised: %s", exc, exc_info=True)
 
 
 def start_scheduler() -> None:
@@ -65,6 +85,18 @@ def start_scheduler() -> None:
         _discovery_job,
         trigger=trigger,
         id=JOB_ID,
+        replace_existing=True,
+    )
+    sched.add_job(
+        _bmf_import_job,
+        trigger=CronTrigger.from_crontab("0 3 1 * *", timezone="UTC"),
+        id=BMF_IMPORT_JOB_ID,
+        replace_existing=True,
+    )
+    sched.add_job(
+        _grants_gov_import_job,
+        trigger=CronTrigger.from_crontab("0 5 * * *", timezone="UTC"),
+        id=GRANTS_GOV_IMPORT_JOB_ID,
         replace_existing=True,
     )
     sched.start()

@@ -187,6 +187,21 @@ class DiscoverySourcesConfig(BaseModel):
     sam_gov: bool = False
     web_search: bool = True
     federal_register: bool = True
+    state_portals: bool = True
+    usaspending: bool = False
+    candid: bool = False  # gated on paid API key
+    philanthropy_digest: bool = False  # defunct (folded into Candid)
+    irs_bmf: bool = True
+    grants_gov_db: bool = True
+
+
+class ImportConfig(BaseModel):
+    bmf_min_asset_code: int = Field(default=7, ge=1, le=9)
+    bmf_ntee_prefixes: List[str] = Field(default_factory=list)
+    bmf_batch_size: int = Field(default=50, ge=10, le=500)
+    grants_gov_close_days: int = Field(default=90, ge=7, le=365)
+    bmf_last_imported_at: Optional[str] = None
+    grants_gov_last_imported_at: Optional[str] = None
 
 
 class DiscoveryConfigRequest(BaseModel):
@@ -196,6 +211,8 @@ class DiscoveryConfigRequest(BaseModel):
     keywords: List[str] = Field(default_factory=list)
     sources: DiscoverySourcesConfig = Field(default_factory=DiscoverySourcesConfig)
     max_per_source: int = Field(default=100, ge=10, le=500)
+    documents_per_run: int = Field(default=200, ge=0, le=1000)
+    import_config: ImportConfig = Field(default_factory=ImportConfig)
 
 
 class DiscoveryConfigResponse(DiscoveryConfigRequest):
@@ -213,6 +230,48 @@ class DiscoveryRunResponse(BaseModel):
     urls_new: int = 0
     scrape_job_id: Optional[str] = None
     error_message: Optional[str] = None
+    progress_snapshot: Optional[Dict[str, Any]] = None
+
+
+class DiscoverySourceProgress(BaseModel):
+    name: str
+    status: str = "pending"
+    urls_found: int = 0
+    urls_new: int = 0
+    documents_found: int = 0
+    current_action: Optional[str] = None
+    error: Optional[str] = None
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+
+
+class DiscoveryProgressResponse(BaseModel):
+    run_id: str
+    status: str
+    sources: Dict[str, DiscoverySourceProgress] = Field(default_factory=dict)
+    urls_discovered: int = 0
+    urls_new: int = 0
+    documents_submitted: int = 0
+    documents_downloaded: int = 0
+    documents_extracted: int = 0
+    documents_skipped_dedup: int = 0
+    documents_errors: int = 0
+    scrape_job_id: Optional[str] = None
+    latest_results: List[Dict[str, Any]] = Field(default_factory=list)
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    error: Optional[str] = None
+    elapsed_seconds: int = 0
+    live: bool = False  # true when read from in-memory registry, false when from DB snapshot
+
+
+class DiscoveryImportStatusResponse(BaseModel):
+    bmf_last_imported_at: Optional[str] = None
+    grants_gov_last_imported_at: Optional[str] = None
+    bmf_funders_total: int = 0
+    bmf_funders_unscraped: int = 0
+    grant_opportunities_total: int = 0
+    grant_opportunities_open: int = 0
 
 
 class SetSamGovKeyRequest(BaseModel):

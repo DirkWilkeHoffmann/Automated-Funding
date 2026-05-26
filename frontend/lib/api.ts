@@ -118,6 +118,9 @@ export const api = {
       body: JSON.stringify({ brave_search_api_key: key }),
     }),
 
+  // Stats
+  stats: () => request<DashboardStats>("/stats"),
+
   // Discovery
   discoveryConfig: () => request<any>("/discovery/config"),
   updateDiscoveryConfig: (data: any) =>
@@ -128,4 +131,119 @@ export const api = {
     request<any[]>(`/discovery/runs?limit=${limit}`),
   discoveryRunStatus: (runId: string) =>
     request<any>(`/discovery/runs/${runId}`),
+  discoveryRunProgress: (runId: string) =>
+    request<DiscoveryProgress>(`/discovery/runs/${runId}/progress`),
+  cancelDiscoveryRun: (runId: string) =>
+    request<DiscoveryProgress>(`/discovery/runs/${runId}/cancel`, { method: "POST" }),
+  discoveryRunScrapedFunds: (runId: string) =>
+    request<ScrapedFundResult[]>(`/discovery/runs/${runId}/scraped-funds`),
+
+  // Import triggers
+  triggerBMFImport: () =>
+    request("/discovery/import/bmf", { method: "POST" }),
+  triggerGrantsGovImport: () =>
+    request("/discovery/import/grants-gov", { method: "POST" }),
+  discoveryImportStatus: () =>
+    request<DiscoveryImportStatus>("/discovery/import/status"),
+};
+
+// ── Import status shape ──────────────────────────────────────────────────────
+
+export type DiscoveryImportStatus = {
+  bmf_last_imported_at: string | null;
+  grants_gov_last_imported_at: string | null;
+  bmf_funders_total: number;
+  bmf_funders_unscraped: number;
+  grant_opportunities_total: number;
+  grant_opportunities_open: number;
+};
+
+// ── Dashboard stats shape ─────────────────────────────────────────────────────
+
+export type DashboardStats = {
+  funds: {
+    total: number;
+    by_eligibility: Record<string, number>;
+    by_grant_type: Record<string, number>;
+    by_discovery_source: Record<string, number>;
+    added_last_7d: number;
+  };
+  discovery: {
+    last_run: {
+      id: string;
+      status: string;
+      urls_discovered: number;
+      urls_new: number;
+      started_at: string | null;
+      trigger: string;
+    } | null;
+    total_runs: number;
+    total_urls_found: number;
+  };
+  org: {
+    name: string | null;
+    state: string | null;
+    profile_complete: boolean;
+    missing_fields: string[];
+  };
+};
+
+// ── Scrape job status shape ───────────────────────────────────────────────────
+
+export type JobStatusResponse = {
+  job_id: string;
+  done: boolean;
+  progress_percent: number;
+  total_urls: number;
+  completed_urls: number;
+  current_url?: string | null;
+  current_elapsed_seconds: number;
+  total_elapsed_seconds: number;
+  started_at?: number | null;
+  finished_at?: number | null;
+  errors: Array<{ url: string; message: string }>;
+};
+
+// ── Discovery scraped-fund result shape ─────────────────────────────────────
+
+export type ScrapedFundResult = {
+  fund_url: string;
+  funder_name?: string | null;
+  eligibility?: string | null;
+  grant_type?: string | null;
+  discovery_source?: string | null;
+};
+
+// ── Discovery progress response shape ────────────────────────────────────────
+
+export type SourceProgress = {
+  name: string;
+  status: "pending" | "running" | "completed" | "failed" | "cancelled" | string;
+  urls_found: number;
+  urls_new: number;
+  documents_found: number;
+  current_action?: string | null;
+  error?: string | null;
+  started_at?: number | null;
+  finished_at?: number | null;
+};
+
+export type DiscoveryProgress = {
+  run_id: string;
+  status: "running" | "running_docs" | "completed" | "failed" | "cancelled" | string;
+  sources: Record<string, SourceProgress>;
+  urls_discovered: number;
+  urls_new: number;
+  documents_submitted: number;
+  documents_downloaded: number;
+  documents_extracted: number;
+  documents_skipped_dedup: number;
+  documents_errors: number;
+  scrape_job_id?: string | null;
+  latest_results: Array<{ url: string; funder_name?: string; source?: string }>;
+  started_at?: number | null;
+  finished_at?: number | null;
+  error?: string | null;
+  elapsed_seconds: number;
+  live: boolean;
 };

@@ -61,6 +61,23 @@ def complete_run(
         logger.error("Could not complete discovery_run %s: %s", run_id, exc)
 
 
+def save_progress_snapshot(run_id: str, snapshot: Dict[str, Any]) -> None:
+    """Persist the live DiscoveryProgress snapshot to discovery_runs.progress_snapshot.
+
+    Best-effort: a failed write does not interrupt the run. The in-memory
+    progress registry is the source of truth while a run is in flight; the
+    snapshot lets the frontend recover state after a page refresh.
+    """
+    if not run_id:
+        return
+    try:
+        get_supabase().table("discovery_runs").update({
+            "progress_snapshot": snapshot,
+        }).eq("id", run_id).execute()
+    except Exception as exc:
+        logger.warning("Could not save progress_snapshot for run %s: %s", run_id, exc)
+
+
 def fail_run(run_id: str, error_message: str) -> None:
     """Update run to status='failed'."""
     if not run_id:

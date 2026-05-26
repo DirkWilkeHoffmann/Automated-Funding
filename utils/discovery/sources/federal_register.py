@@ -51,13 +51,24 @@ def fetch_federal_register_grants(
         since = datetime.now(timezone.utc) - timedelta(days=30)
         since_date = since.strftime("%Y-%m-%d")
 
+    # Federal Register's `conditions[term]` is a phrase-search, so combining
+    # caller keywords with "grants funding opportunity" never matches.
+    # Strategy: when caller provides a single-word/short keyword, use it
+    # standalone. Otherwise fall back to a single broad term that returns
+    # the most NOFAs ("grants").
+    kw_clean = (keywords or "").strip()
+    if kw_clean and len(kw_clean.split()) <= 2:
+        term = kw_clean
+    else:
+        term = "grants"
+
     params: Dict[str, Any] = {
-        "conditions[term]": f"{keywords} grants funding opportunity",
+        "conditions[term]": term,
         "conditions[type][]": "NOTICE",
         "conditions[publication_date][gte]": since_date,
         "per_page": min(max_results, 100),
         "order": "newest",
-        "fields[]": ["html_url", "title", "publication_date", "agencies"],
+        "fields[]": ["html_url", "title", "publication_date", "agencies", "pdf_url"],
     }
 
     try:

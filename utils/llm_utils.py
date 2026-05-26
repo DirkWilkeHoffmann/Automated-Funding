@@ -2,6 +2,8 @@
 
 import json
 import logging
+import os
+from datetime import datetime
 from functools import lru_cache
 from typing import Any, Dict, Optional
 
@@ -17,6 +19,67 @@ logger = logging.getLogger(__name__)
 _MAX_CHARS = 30000
 _MODEL_FAST = "gpt-4o-mini"
 _MODEL_FULL = "gpt-4.1"
+
+# Set to True to write every LLM call + response to logs/ in the repo root.
+LLM_DEBUG_LOGGING = True
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_LOG_PATH = os.path.join(_REPO_ROOT, "logs", "llm_debug.log")
+_ANALYSIS_LOG_DIR = os.path.join(_REPO_ROOT, "logs", "analysis")
+
+
+def _write_debug_log(
+    *,
+    fund_url: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    response_text: str,
+    eligibility: str,
+) -> None:
+    if not LLM_DEBUG_LOGGING:
+        return
+    try:
+        from utils.utils_helpers import safe_filename_from_url
+
+        sep = "=" * 100
+        thin = "-" * 100
+        ts = datetime.now().isoformat()
+
+        lines = [
+            "",
+            sep,
+            f"TIMESTAMP  : {ts}",
+            f"FUND URL   : {fund_url}",
+            f"MODEL      : {model}",
+            f"ELIGIBILITY: {eligibility}",
+            thin,
+            "── SYSTEM PROMPT ──",
+            system_prompt.strip(),
+            thin,
+            "── USER PROMPT (org profile + scraped text) ──",
+            user_prompt.strip(),
+            thin,
+            "── RAW LLM RESPONSE ──",
+            response_text.strip(),
+            sep,
+            "",
+        ]
+        entry = "\n".join(lines)
+
+        # 1. Append to the global rolling log.
+        os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
+        with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(entry)
+
+        # 2. Write a per-URL analysis log (overwritten on each new scrape).
+        if fund_url:
+            os.makedirs(_ANALYSIS_LOG_DIR, exist_ok=True)
+            url_safe = safe_filename_from_url(fund_url)
+            with open(os.path.join(_ANALYSIS_LOG_DIR, f"{url_safe}.txt"), "w", encoding="utf-8") as f:
+                f.write(entry)
+
+    except Exception as exc:
+        logger.warning("Could not write LLM debug log: %s", exc)
 
 
 @lru_cache(maxsize=1)
@@ -63,7 +126,7 @@ def get_client() -> Optional[OpenAI]:
         return None
 
 
-def call_llm_extract(text: str) -> Dict[str, Any]:
+def call_llm_extract(text: str, fund_url: str = "") -> Dict[str, Any]:
     """
     Extract funding information from text.
 
@@ -84,14 +147,14 @@ def call_llm_extract(text: str) -> Dict[str, Any]:
     system_prompt, user_prompt_template = get_prompt_templates()
     prompt = user_prompt_template.format(org_profile=org_profile, text=text)
 
-    result = _call_model(client, prompt, _MODEL_FAST, system_prompt=system_prompt)
+    result = _call_model(client, prompt, _MODEL_FAST, system_prompt=system_prompt, fund_url=fund_url)
     if _is_thin_result(result) and len(text) > 2000:
         log_message(f"Thin result from {_MODEL_FAST}; retrying with {_MODEL_FULL}", "warning")
-        result = _call_model(client, prompt, _MODEL_FULL, system_prompt=system_prompt)
+        result = _call_model(client, prompt, _MODEL_FULL, system_prompt=system_prompt, fund_url=fund_url)
     return result
 
 
-def _call_model(client: OpenAI, prompt: str, model: str, *, system_prompt: str = "") -> Dict[str, Any]:
+def _call_model(client: OpenAI, prompt: str, model: str, *, system_prompt: str = "", fund_url: str = "") -> Dict[str, Any]:
     from utils.constants.llm import LLM_SYSTEM_PROMPT
     try:
         resp = client.chat.completions.create(
@@ -104,7 +167,8 @@ def _call_model(client: OpenAI, prompt: str, model: str, *, system_prompt: str =
             response_format={"type": "json_object"},
             timeout=60,
         )
-        data = json.loads(resp.choices[0].message.content)
+        response_text = resp.choices[0].message.content
+        data = json.loads(response_text)
 
         normalized = {
             "applicant_types": data.get("applicant_types", []),
@@ -132,6 +196,15 @@ def _call_model(client: OpenAI, prompt: str, model: str, *, system_prompt: str =
             if isinstance(normalized[key], list):
                 normalized[key] = "; ".join(normalized[key]) if normalized[key] else ""
 
+        _write_debug_log(
+            fund_url=fund_url,
+            model=model,
+            system_prompt=system_prompt or LLM_SYSTEM_PROMPT,
+            user_prompt=prompt,
+            response_text=response_text,
+            eligibility=normalized["eligibility"],
+        )
+
         return normalized
 
     except json.JSONDecodeError as e:
@@ -147,6 +220,106 @@ def _is_thin_result(result: Dict[str, Any]) -> bool:
     important = ["applicant_types", "geographic_scope", "beneficiary_focus", "funding_range", "evidence"]
     empty_count = sum(1 for k in important if not result.get(k))
     return empty_count >= 3 or result.get("eligibility") not in ELIGIBILITY_ORDER
+
+
+_DOCUMENT_SYSTEM_PROMPT = (
+    "You analyse grant-related documents to surface signals useful to a nonprofit "
+    "applying for funding. Reply with strict JSON matching the requested schema. "
+    "Use empty strings or empty arrays when information is not present."
+)
+
+_FORM_990_USER_PROMPT = """Extract grant-signals from this Form 990 (or 990-PF) text.
+
+Return JSON with EXACTLY these keys:
+  program_areas: array of strings — funder's stated grantmaking focus areas
+  total_grants_paid: string — dollar amount paid as grants this year (e.g. "$1,250,000") or ""
+  top_grantees: array of objects {{name, amount, purpose}} for up to 10 largest grants this filing year
+  contact_email: string or ""
+  contact_phone: string or ""
+  application_process: string — brief description of how to apply, or "" if not disclosed
+  geographic_scope: string — where the funder gives (e.g. "California only", "national", "")
+
+Form 990 text:
+{text}"""
+
+_RFP_USER_PROMPT = """Extract grant-signals from this funding opportunity / RFP / NOFA text.
+
+Return JSON with EXACTLY these keys:
+  eligibility: string — who can apply
+  funding_range: string — $ amount(s) available
+  deadline: string — application due date or "rolling" / ""
+  program_focus: string — topical focus
+  application_url: string — where to apply or ""
+  contact: string — name/email/phone of program contact or ""
+  geographic_scope: string — eligible geography
+
+RFP / notice text:
+{text}"""
+
+
+def extract_from_document(text: str, kind: str) -> Dict[str, Any]:
+    """Pull grant signals out of a downloaded document.
+
+    `kind` is one of: 'form_990', 'rfp', 'notice', 'attachment'.
+    Uses the same gpt-4o-mini → gpt-4.1 fallback as call_llm_extract.
+    Returns {} when no LLM key is configured so callers can persist the
+    document text without a summary and skip cost.
+    """
+    client = get_client()
+    if client is None:
+        return {}
+
+    if not text or not text.strip():
+        return {}
+
+    if len(text) > _MAX_CHARS:
+        log_message(
+            f"Document text truncated from {len(text)} to {_MAX_CHARS} chars for {kind}",
+            "warning",
+        )
+        half = _MAX_CHARS // 2
+        text = text[:half] + "\n...[content truncated]...\n" + text[-half:]
+
+    template = _FORM_990_USER_PROMPT if kind == "form_990" else _RFP_USER_PROMPT
+    prompt = template.format(text=text)
+
+    result = _call_document_model(client, prompt, _MODEL_FAST)
+    if _is_thin_doc_result(result, kind) and len(text) > 2000:
+        log_message(
+            f"Thin document result from {_MODEL_FAST} for {kind}; retrying with {_MODEL_FULL}",
+            "warning",
+        )
+        result = _call_document_model(client, prompt, _MODEL_FULL)
+    return result
+
+
+def _call_document_model(client: OpenAI, prompt: str, model: str) -> Dict[str, Any]:
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _DOCUMENT_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+            timeout=60,
+        )
+        return json.loads(resp.choices[0].message.content)
+    except json.JSONDecodeError as exc:
+        log_message(f"Invalid JSON from document LLM ({model}): {exc}", "error")
+        return {}
+    except Exception as exc:
+        log_message(f"Document LLM extraction failed ({model}): {exc}", "error")
+        return {}
+
+
+def _is_thin_doc_result(result: Dict[str, Any], kind: str) -> bool:
+    if not result:
+        return True
+    if kind == "form_990":
+        return not (result.get("program_areas") or result.get("top_grantees"))
+    return not (result.get("eligibility") or result.get("funding_range") or result.get("program_focus"))
 
 
 def _empty_result(notes: str, evidence: str) -> Dict[str, Any]:

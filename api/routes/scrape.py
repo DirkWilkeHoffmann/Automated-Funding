@@ -146,24 +146,54 @@ def cancel_job(job_id: str, _user=Depends(dependencies.require_user)):
 @router.get("/jobs/{job_id}", response_model=JobStatusResponse)
 def job_status(job_id: str, _user=Depends(dependencies.require_user)):
     job = job_store.get(job_id)
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job:
+        snapshot = job.snapshot()
+        errors = [JobError(url=err[0], message=err[1]) for err in snapshot["errors"]]
+        return JobStatusResponse(
+            job_id=snapshot["job_id"],
+            done=snapshot["done"],
+            progress_percent=snapshot["progress_percent"],
+            results=snapshot["results"],
+            errors=errors,
+            current_url=snapshot.get("current_url"),
+            current_elapsed_seconds=snapshot.get("current_elapsed_seconds", 0),
+            total_elapsed_seconds=snapshot.get("total_elapsed_seconds", 0),
+            started_at=snapshot.get("started_at"),
+            finished_at=snapshot.get("finished_at"),
+            url_timings=snapshot.get("url_timings", []),
+            total_urls=snapshot.get("total_urls", 0),
+            completed_urls=snapshot.get("completed_urls", 0),
+        )
 
-    snapshot = job.snapshot()
-    errors = [JobError(url=err[0], message=err[1]) for err in snapshot["errors"]]
-    # TODO: extend this endpoint (or add websockets/server-sent events) to push live status updates to clients.
-    return JobStatusResponse(
-        job_id=snapshot["job_id"],
-        done=snapshot["done"],
-        progress_percent=snapshot["progress_percent"],
-        results=snapshot["results"],
-        errors=errors,
-        current_url=snapshot.get("current_url"),
-        current_elapsed_seconds=snapshot.get("current_elapsed_seconds", 0),
-        total_elapsed_seconds=snapshot.get("total_elapsed_seconds", 0),
-        started_at=snapshot.get("started_at"),
-        finished_at=snapshot.get("finished_at"),
-        url_timings=snapshot.get("url_timings", []),
-        total_urls=snapshot.get("total_urls", 0),
-        completed_urls=snapshot.get("completed_urls", 0),
-    )
+    # Fallback to DB — handles server restarts where in-memory state is lost.
+    try:
+        from datetime import datetime, timezone
+        from utils.db.client import get_supabase
+        resp = get_supabase().table("scrape_jobs").select(
+            "id,done,total_urls,completed_urls,progress_percent,finished_at"
+        ).eq("id", job_id).limit(1).execute()
+        rows = resp.data or []
+        if rows:
+            row = rows[0]
+            finished_at: Optional[float] = None
+            raw_finished = row.get("finished_at")
+            if raw_finished:
+                try:
+                    dt = datetime.fromisoformat(raw_finished.replace("Z", "+00:00"))
+                    finished_at = dt.timestamp()
+                except Exception:
+                    pass
+            return JobStatusResponse(
+                job_id=job_id,
+                done=bool(row.get("done", True)),
+                progress_percent=int(row.get("progress_percent") or 100),
+                results=[],
+                errors=[],
+                total_urls=int(row.get("total_urls") or 0),
+                completed_urls=int(row.get("completed_urls") or 0),
+                finished_at=finished_at,
+            )
+    except Exception:
+        pass
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")

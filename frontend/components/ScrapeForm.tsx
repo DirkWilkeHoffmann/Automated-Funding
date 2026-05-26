@@ -133,6 +133,11 @@ export default function ScrapeForm() {
         const status = await api.jobStatus(job.job_id);
         setJob(status);
       } catch (err: any) {
+        const msg = (err?.message || "").toLowerCase();
+        if (msg.includes("not found") || msg.includes("404")) {
+          // Server restarted — stop polling and mark done so results stay visible.
+          setJob((prev) => prev ? { ...prev, done: true, progress_percent: 100 } : null);
+        }
         console.error(err);
       }
     }, 4000);

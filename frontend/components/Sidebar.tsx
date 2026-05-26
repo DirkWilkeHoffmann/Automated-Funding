@@ -7,6 +7,7 @@ import {
   BarChart3,
   Building2,
   Key,
+  LayoutDashboard,
   LogOut,
   PanelLeftClose,
   PanelLeftOpen,
@@ -22,7 +23,8 @@ import { Tooltip } from "./ui/tooltip";
 type NavItem = { href: string; label: string; icon: any };
 
 const MAIN_ITEMS: NavItem[] = [
-  { href: "/", label: "Scrape & Analyse", icon: Zap },
+  { href: "/", label: "Dashboard", icon: LayoutDashboard },
+  { href: "/scrape", label: "Scrape & Analyse", icon: Zap },
   { href: "/results", label: "Results", icon: BarChart3 },
   { href: "/settings", label: "Settings", icon: Settings2 },
 ];
@@ -31,7 +33,7 @@ const ADMIN_ITEMS: NavItem[] = [
   { href: "/admin/organisation", label: "Organisation & AI", icon: Building2 },
   { href: "/admin/users", label: "Users", icon: Users },
   { href: "/admin/keys", label: "API Keys", icon: Key },
-  { href: "/admin/discovery", label: "Auto-Discovery", icon: Radar },
+  { href: "/discovery", label: "Auto-Discovery", icon: Radar },
 ];
 
 const STORAGE_KEY = "sidebar_collapsed_v1";

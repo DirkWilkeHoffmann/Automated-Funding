@@ -28,4 +28,7 @@ CSV_COLUMNS = [
     "extraction_timestamp",
     "error",
     "discovery_source",
+    "content_hash",
+    "last_checked_at",
+    "discovery_funder_ein",
 ]

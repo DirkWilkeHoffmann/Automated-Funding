@@ -11,10 +11,15 @@ ELIGIBILITY_ORDER = [
 LLM_SYSTEM_PROMPT = (
     "You are a senior grant analyst specialising in US nonprofit workforce development and economic empowerment funding. "
     "Your evaluations are relied upon to decide which opportunities are worth the staff time to pursue — accuracy matters above all else. "
-    "Rules you must follow: (1) base every conclusion only on text actually present in the grant page — never infer or invent eligibility criteria; "
-    "(2) apply the eligibility scale consistently using the exact definitions given; "
-    "(3) quote or closely paraphrase phrases from the source text as evidence; "
-    "(4) always give a clear, actionable recommendation."
+    "Rules you must follow: "
+    "(1) For formal RFPs, NOFAs, and published grant guidelines: base conclusions only on text actually present — never invent criteria not in the text. "
+    "(2) For private or community foundation websites WITHOUT published grant guidelines: use their stated grantmaking focus areas, geographic language, and past grantee examples to infer eligibility. "
+    "If the foundation funds nonprofits in a relevant topic area AND the geography aligns, rate 'Possibly Eligible' or higher — NOT 'Low Match'. "
+    "Reserve 'Not Eligible' only for explicit exclusions (e.g. 'schools only', 'government agencies only', 'no nonprofits'). "
+    "'Low Match' means the topical focus clearly does not align — not merely that criteria are unstated. "
+    "(3) Apply the eligibility scale consistently using the exact definitions given. "
+    "(4) Quote or closely paraphrase phrases from the source text (including any 990 data provided) as evidence. "
+    "(5) Always give a clear, actionable recommendation."
 )
 
 LLM_PROMPT = """Evaluate the funding opportunity below against the organisation profile provided. Extract structured data and assess eligibility using the calibrated rubric.
@@ -30,14 +35,21 @@ LLM_PROMPT = """Evaluate the funding opportunity below against the organisation 
 "Low Match"         — Funding focus, geography, or applicant type is a poor fit, though no explicit exclusion bars the org from applying.
 "Not Eligible"      — An explicit restriction, requirement, or exclusion clearly bars this organisation from applying.
 
+IMPORTANT — foundation websites vs. formal RFPs:
+Most private and community foundation websites do NOT publish explicit eligibility criteria.
+For these pages, infer eligibility from: (a) stated grantmaking focus areas, (b) geographic scope language, (c) past grantee names or types, (d) any IRS Form 990 data included below.
+Do NOT rate a foundation "Low Match" or "Not Eligible" simply because explicit criteria are absent.
+If the foundation's focus areas overlap with the org's mission and geography plausibly aligns, use "Possibly Eligible" or "Eligible".
+Only use "Not Eligible" when text explicitly restricts applicants in a way that bars this org.
+
 === EVALUATION CRITERIA (in priority order) ===
-1. Applicant type: Does the funder explicitly accept 501(c)(3) nonprofits or workforce/employment organisations?
-2. Geographic scope: Does the grant cover the organisation's location or service area? If the grant restricts to US-only beneficiaries, assess whether the organisation's US operations qualify rather than treating it as an automatic exclusion.
+1. Applicant type: Does the funder explicitly accept 501(c)(3) nonprofits or workforce/employment organisations? For foundations, do past grantees suggest nonprofits are welcome?
+2. Geographic scope: Does the grant/foundation cover the organisation's location or service area? If the grant restricts to US-only beneficiaries, assess whether the organisation's US operations qualify rather than treating it as an automatic exclusion.
 3. Mission alignment: Does the funder's focus match workforce development, employment training, or economic empowerment?
 4. Size and scale: Is the funding range, required budget, or organisational size a fit?
 5. Explicit exclusions: Is there any restriction that clearly bars this organisation?
 
-=== GRANT PAGE TEXT ===
+=== GRANT PAGE TEXT (may include IRS 990 structured data) ===
 {text}
 === END OF GRANT PAGE TEXT ===
 

@@ -60,11 +60,16 @@ def search_sam_gov(
     page = 0
     page_size = min(max_results, 100)
 
+    # SAM.gov rejects requests with only postedFrom — it demands both ends of
+    # the window. Default postedTo to today (MM/DD/YYYY format the API wants).
+    posted_to = datetime.now(timezone.utc).strftime("%m/%d/%Y")
+
     while len(results) < max_results:
         params = {
             "api_key": api_key.strip(),
             "q": keywords,
             "postedFrom": posted_from,
+            "postedTo": posted_to,
             "limit": page_size,
             "offset": page * page_size,
             "ptype": "o,p,k,r,s",  # presolicitation, sources sought, combined synopsis, etc.
@@ -88,6 +93,9 @@ def search_sam_gov(
             title = opp.get("title", "")
             agency = opp.get("organizationHierarchy", [{}])
             agency_name = agency[0].get("name", "") if agency else opp.get("organizationName", "")
+            resource_links = opp.get("resourceLinks") or []
+            if not isinstance(resource_links, list):
+                resource_links = []
             results.append({
                 "opportunity_id": notice_id,
                 "title": title,
@@ -101,6 +109,7 @@ def search_sam_gov(
                     else ""
                 ),
                 "notice_id": notice_id,
+                "resource_links": resource_links,
             })
 
         if len(opportunities) < page_size:

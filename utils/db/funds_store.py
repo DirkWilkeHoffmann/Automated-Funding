@@ -87,3 +87,17 @@ def append_funds(rows: List[dict]) -> None:
         clear_funds_cache()
     except Exception as exc:
         log_message(f"Failed to write funds to Supabase: {exc}", "error")
+
+
+def upsert_fund(record: dict, existing_id: str = None) -> None:
+    """Update an existing fund record by row ID, or insert if no ID provided."""
+    valid_cols = set(CSV_COLUMNS)
+    cleaned = {k: (str(v) if v is not None else None) for k, v in record.items() if k in valid_cols}
+    try:
+        if existing_id:
+            get_supabase().table("funds").update(cleaned).eq("id", existing_id).execute()
+        else:
+            get_supabase().table("funds").insert(cleaned).execute()
+        clear_funds_cache()
+    except Exception as exc:
+        log_message(f"Failed to upsert fund {record.get('fund_url')}: {exc}", "error")

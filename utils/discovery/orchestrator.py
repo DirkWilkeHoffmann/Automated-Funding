@@ -1,35 +1,94 @@
-"""Discovery orchestrator — runs source queries and feeds new URLs into the scrape pipeline."""
+"""Discovery orchestrator — runs sources in parallel and streams progress.
+
+Phase 1 (parallel + streaming):
+  - Each enabled source is wrapped as a DiscoverySource (see sources/registry.py)
+    and runs concurrently in a ThreadPoolExecutor.
+  - A shared DiscoveryProgress object is updated as sources yield results.
+  - On every update a compact snapshot is persisted to
+    discovery_runs.progress_snapshot so the UI can recover state after refresh.
+  - Cancellation: POST /discovery/runs/{id}/cancel sets the cancel_token;
+    sources check it between API pages.
+"""
 
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from utils.discovery.config_store import load_config, load_discovery_state, save_discovery_state
-from utils.discovery.run_store import complete_run, create_run, fail_run
 from utils.db.funds_store import get_processed_urls
+from utils.discovery.config_store import (
+    load_config,
+    load_discovery_state,
+    save_discovery_state,
+)
+from utils.discovery.progress_registry import progress_registry
+from utils.discovery.run_store import (
+    complete_run,
+    create_run,
+    fail_run,
+    save_progress_snapshot,
+)
+from utils.discovery.document_fetcher import (
+    DOCUMENTS_PER_RUN_DEFAULT,
+    fetch_documents,
+)
+from utils.discovery.sources.base import DocumentRef, SourceContext, SourceResult
+from utils.discovery.sources.registry import (
+    CandidSource,
+    FederalRegisterSource,
+    GrantsGovDBSource,
+    GrantsGovSource,
+    IRS_BMF_Source,
+    PhilanthropyDigestSource,
+    ProPublicaSource,
+    SamGovSource,
+    StatePortalsSource,
+    USAspendingSource,
+    WebSearchSource,
+)
+from utils.models import DiscoveryProgress
 from utils.utils_helpers import normalize_url
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_KEYWORDS = "workforce development employment training nonprofit"
+_SNAPSHOT_MIN_INTERVAL_SECS = 1.0  # throttle DB writes; UI gets in-memory data anyway
 
-# Full list of US states for ProPublica rotation (5 per run → 10 runs per full cycle)
-_US_STATES = [
-    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
-    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
-    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
-    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
-    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
-]
-_STATES_PER_RUN = 5
+
+def _get_effective_states(config: dict) -> List[str]:
+    """Return the states to use for discovery.
+
+    Priority:
+      1. Operator-configured states (explicit intent wins)
+      2. Org home state from the organizations table (avoids rotating through
+         all 50 US states when the user hasn't configured anything, which
+         means ProPublica surfaces foundations spread across the whole country
+         and geographic matching tanks)
+      3. Empty list → sources handle fallback internally
+    """
+    explicit = [s.upper() for s in (config.get("states") or []) if s]
+    if explicit:
+        return explicit
+    org = _get_org_profile()
+    home_state = (org.get("state") or "").strip().upper()
+    if home_state:
+        logger.info(
+            "No discovery states configured — using org home state %s as default", home_state
+        )
+        return [home_state]
+    return []
+
+
+# ── Org / config helpers (unchanged) ──────────────────────────────────────────
 
 
 @lru_cache(maxsize=1)
 def _get_org_profile() -> dict:
-    """Load org profile once per process; cleared on app restart."""
     try:
         from utils.db.client import get_supabase
         rows = (
@@ -47,35 +106,68 @@ def _get_org_profile() -> dict:
         return {}
 
 
+_SMART_QUOTES = str.maketrans({
+    "‘": "'", "’": "'",  # smart single quotes
+    "“": '"', "”": '"',  # smart double quotes
+    "–": "-", "—": "-",  # en/em dashes
+    " ": " ",                  # non-breaking space
+})
+
+
 def _derive_keywords(config: dict) -> str:
-    """Return search keywords: config list → org mission/services → built-in default."""
+    """Build a search query string from explicit config or the org profile.
+
+    Priority:
+      1. Operator-set config['keywords'] (explicit intent)
+      2. Org's `services` list (structured, topical — best signal)
+      3. First sentence of the org's mission (filtered for stopwords)
+      4. _DEFAULT_KEYWORDS
+
+    Always strips smart-quote / unicode punctuation so the result is safe to
+    URL-encode for downstream search APIs (ProPublica was returning 404s on
+    queries containing U+2019).
+    """
     keywords_list: List[str] = config.get("keywords") or []
     if keywords_list:
-        return " ".join(keywords_list)
+        return " ".join(keywords_list).translate(_SMART_QUOTES).strip()
 
     org = _get_org_profile()
     parts: List[str] = []
-    if org.get("mission"):
-        parts.extend(org["mission"].split()[:8])
-    if org.get("services"):
-        services = org["services"]
-        if isinstance(services, list) and services:
-            parts.extend(str(services[0]).split()[:4])
 
-    STOP = {"the", "a", "an", "and", "or", "to", "for", "of", "in", "is", "we", "our"}
+    services = org.get("services")
+    if isinstance(services, list) and services:
+        # Take the first 3 services — they're already structured topical terms
+        for svc in services[:3]:
+            parts.extend(str(svc).split())
+
+    # Fall back to the FIRST SENTENCE of the mission only — beyond that is
+    # narrative text that pollutes the query
+    if not parts and org.get("mission"):
+        mission = str(org["mission"]).translate(_SMART_QUOTES)
+        first_sentence = mission.split(".")[0]
+        parts.extend(first_sentence.split()[:10])
+
+    STOP = {
+        "the", "a", "an", "and", "or", "to", "for", "of", "in", "is", "we", "our",
+        "this", "that", "are", "be", "have", "with", "from", "by", "on", "as",
+        "it", "its", "we're", "they", "their", "easy", "feel", "about",
+    }
     seen: set = set()
     filtered: List[str] = []
     for w in parts:
-        wl = w.lower().strip(".,;:()")
-        if len(wl) > 3 and wl not in STOP and wl not in seen:
-            seen.add(wl)
-            filtered.append(wl)
+        wl = w.lower().translate(_SMART_QUOTES).strip(".,;:()'\"-")
+        # Reject anything that isn't plain alphabetic — kills URL-breaking chars
+        if not wl.isalpha():
+            continue
+        if len(wl) <= 3 or wl in STOP or wl in seen:
+            continue
+        seen.add(wl)
+        filtered.append(wl)
 
     return " ".join(filtered[:6]) if filtered else _DEFAULT_KEYWORDS
 
 
 def _get_api_key(service: str) -> Optional[str]:
-    """Read an API key from the api_tokens table. Returns None if not found."""
     try:
         from utils.db.client import get_supabase
         rows = (
@@ -94,16 +186,146 @@ def _get_api_key(service: str) -> Optional[str]:
         return None
 
 
+# ── Source assembly ──────────────────────────────────────────────────────────
+
+
+def _build_enabled_sources(config: dict) -> List[Any]:
+    """Return concrete DiscoverySource instances based on the config toggles."""
+    sources_cfg = config.get("sources") or {}
+    org = _get_org_profile()
+    org_state = (org.get("state") or "").strip().upper() or None
+    enabled: List[Any] = []
+
+    if sources_cfg.get("propublica", True):
+        enabled.append(ProPublicaSource())
+    if sources_cfg.get("grants_gov", True):
+        enabled.append(GrantsGovSource())
+    # SAM.gov: only run when the toggle is explicitly on AND the key exists.
+    # Earlier behaviour auto-enabled it whenever the key was present, which
+    # surprised users who had deliberately turned it off in the admin UI.
+    if sources_cfg.get("sam_gov", False):
+        sam_key = _get_api_key("sam_gov")
+        if sam_key:
+            enabled.append(SamGovSource(api_key=sam_key))
+        else:
+            logger.info("SAM.gov enabled but no api_token configured — skipping")
+    if sources_cfg.get("web_search", True):
+        enabled.append(WebSearchSource(brave_api_key=_get_api_key("brave_search"), org_state=org_state))
+    if sources_cfg.get("federal_register", True):
+        enabled.append(FederalRegisterSource())
+    if sources_cfg.get("state_portals", True):
+        enabled.append(StatePortalsSource())
+    # usaspending.gov/recipient/* pages show who received money, not open opportunities.
+    # Disabled by default; grants.gov + federal_register cover federal opportunities.
+    if sources_cfg.get("usaspending", False):
+        enabled.append(USAspendingSource())
+    # Candid: paid API; only enable if both toggled and a key is present
+    candid_key = _get_api_key("candid")
+    if sources_cfg.get("candid", False) and candid_key:
+        enabled.append(CandidSource(api_key=candid_key, org_state=org_state))
+    if sources_cfg.get("philanthropy_digest", False):
+        # Kept for backwards compat — source is defunct (Candid acquired it)
+        enabled.append(PhilanthropyDigestSource())
+    if sources_cfg.get("irs_bmf", True):
+        enabled.append(IRS_BMF_Source())
+    if sources_cfg.get("grants_gov_db", True):
+        enabled.append(GrantsGovDBSource())
+
+    return enabled
+
+
+# ── Snapshot throttling ──────────────────────────────────────────────────────
+
+
+class _SnapshotThrottle:
+    """Limit progress_snapshot writes to ~1/sec but always write terminal states."""
+
+    def __init__(self) -> None:
+        self._last_write = 0.0
+        self._lock = threading.Lock()
+
+    def maybe_write(self, progress: DiscoveryProgress, *, force: bool = False) -> None:
+        now = time.time()
+        with self._lock:
+            if not force and (now - self._last_write) < _SNAPSHOT_MIN_INTERVAL_SECS:
+                return
+            self._last_write = now
+        save_progress_snapshot(progress.run_id, progress.to_snapshot())
+
+
+# ── Per-source worker ────────────────────────────────────────────────────────
+
+
+def _run_source(
+    source: Any,
+    config: dict,
+    state_for_source: Dict[str, Any],
+    progress: DiscoveryProgress,
+    throttle: _SnapshotThrottle,
+    keywords: str,
+    effective_states: List[str],
+) -> Tuple[str, List[Tuple[str, str, Optional[str]]], List[DocumentRef], Dict[str, Any]]:
+    """Run a single source to completion in its worker thread.
+
+    Returns: (source_name, [(url, source_name, funder_name)], [document_refs], new_state)
+    """
+    name = source.name
+    progress.update_source(name, status="running", current_action="starting")
+    throttle.maybe_write(progress)
+
+    def progress_cb(_name: str, update: Dict[str, Any]) -> None:
+        progress.update_source(_name, **update)
+        throttle.maybe_write(progress)
+
+    ctx = SourceContext(
+        keywords=keywords,
+        states=effective_states,
+        max_per_source=int(config.get("max_per_source") or 100),
+        state=state_for_source or {},
+        progress_cb=progress_cb,
+        cancel_token=progress.cancel_token,
+    )
+
+    collected: List[Tuple[str, str, Optional[str]]] = []
+    documents: List[DocumentRef] = []
+    error: Optional[str] = None
+    try:
+        for result in source.fetch(ctx):
+            collected.append((result.url, name, result.funder_name))
+            sp = progress.ensure_source(name)
+            sp.urls_found = len(collected)
+            if result.documents:
+                # Tag each doc with its source so the fetcher can persist it
+                for d in result.documents:
+                    if not isinstance(d.extra, dict):
+                        d.extra = {}
+                    d.extra.setdefault("source", name)
+                    documents.append(d)
+                sp.documents_found = len(documents)
+            throttle.maybe_write(progress)
+    except Exception as exc:
+        logger.warning("Source %s crashed: %s", name, exc, exc_info=True)
+        error = str(exc)
+
+    new_state = source.close_state()
+
+    if progress.cancel_token.is_set():
+        progress.update_source(name, status="cancelled", current_action="cancelled")
+    elif error:
+        progress.update_source(name, status="failed", error=error, current_action=f"failed: {error}")
+    else:
+        progress.update_source(name, status="completed")
+
+    throttle.maybe_write(progress, force=True)
+    logger.info("Source %s finished: %d URLs, %d documents", name, len(collected), len(documents))
+    return name, collected, documents, new_state
+
+
+# ── Main entry point ─────────────────────────────────────────────────────────
+
+
 def run_discovery(*, trigger: str = "scheduled", run_id: str | None = None) -> str:
-    """
-    Full discovery cycle:
-      1. Load config and per-source state.
-      2. Collect URLs from each enabled source (passing state for date filtering / rotation).
-      3. Diff against already-processed URLs.
-      4. If new URLs exist, kick off a batch scrape job.
-      5. Save updated source state and record run completion.
-    Returns the run_id (empty string if skipped).
-    """
+    """Full discovery cycle, parallel across sources with live progress."""
     config = load_config()
     if not config.get("enabled") and trigger != "manual":
         logger.debug("Auto-discovery is disabled; skipping scheduled run")
@@ -113,77 +335,145 @@ def run_discovery(*, trigger: str = "scheduled", run_id: str | None = None) -> s
         run_id = create_run(trigger, config)
     logger.info("Discovery run %s started (trigger=%s)", run_id, trigger)
 
+    # Register live progress so the frontend can poll /progress immediately.
+    progress = progress_registry.create(run_id)
+    throttle = _SnapshotThrottle()
+
     discovery_state: Dict[str, Any] = {}
     new_state: Dict[str, Any] = {}
     all_discovered: List[str] = []
     new_urls: List[str] = []
     scrape_job_id: str | None = None
-    collection_failed = False
+    url_to_source: Dict[str, str] = {}
+    url_to_funder: Dict[str, str] = {}
+    all_documents: List[DocumentRef] = []
+    failure: Optional[str] = None
 
     try:
         discovery_state = load_discovery_state()
-        url_to_source: Dict[str, str] = {}
-        sources = config.get("sources") or {}
+        sources = _build_enabled_sources(config)
+        keywords = _derive_keywords(config)
+        effective_states = _get_effective_states(config)
 
-        if sources.get("propublica", True):
-            urls, src_state = _collect_propublica(config, discovery_state.get("propublica", {}))
-            for url, source in urls:
-                url_to_source[url] = source
-            new_state["propublica"] = src_state
+        # Seed pending source slots so the UI shows the full grid from t=0
+        for s in sources:
+            progress.ensure_source(s.name)
+        throttle.maybe_write(progress, force=True)
 
-        if sources.get("grants_gov", True):
-            urls, src_state = _collect_grants_gov(config, discovery_state.get("grants_gov", {}))
-            for url, source in urls:
-                url_to_source[url] = source
-            new_state["grants_gov"] = src_state
-
-        # SAM.gov: run if toggled on in config, or automatically when a key exists
-        if sources.get("sam_gov", False) or _get_api_key("sam_gov"):
-            urls, src_state = _collect_sam_gov(config, discovery_state.get("sam_gov", {}))
-            for url, source in urls:
-                url_to_source[url] = source
-            new_state["sam_gov"] = src_state
-
-        if sources.get("web_search", True):
-            urls, src_state = _collect_web_search(config, discovery_state.get("web_search", {}))
-            for url, source in urls:
-                url_to_source[url] = source
-            new_state["web_search"] = src_state
-
-        if sources.get("federal_register", True):
-            urls, src_state = _collect_federal_register(config, discovery_state.get("federal_register", {}))
-            for url, source in urls:
-                url_to_source[url] = source
-            new_state["federal_register"] = src_state
+        max_workers = max(1, len(sources))
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="disc") as pool:
+            futures = {
+                pool.submit(
+                    _run_source,
+                    s,
+                    config,
+                    discovery_state.get(s.name, {}),
+                    progress,
+                    throttle,
+                    keywords,
+                    effective_states,
+                ): s.name
+                for s in sources
+            }
+            for fut in as_completed(futures):
+                src_name = futures[fut]
+                try:
+                    name, collected, docs, src_state = fut.result()
+                    new_state[name] = src_state
+                    for url, source_name, funder_name in collected:
+                        if url and url not in url_to_source:
+                            url_to_source[url] = source_name
+                            if funder_name:
+                                url_to_funder[url] = funder_name
+                    all_documents.extend(docs)
+                except Exception as exc:
+                    logger.error("Source %s failed at top level: %s", src_name, exc, exc_info=True)
+                    progress.update_source(src_name, status="failed", error=str(exc))
 
         all_discovered = list(url_to_source.keys())
-        logger.info("Discovery found %d total URLs", len(all_discovered))
+        progress.urls_discovered = len(all_discovered)
+        logger.info("Discovery found %d total URLs, %d documents", len(all_discovered), len(all_documents))
+        throttle.maybe_write(progress, force=True)
 
-        processed = get_processed_urls(force_refresh=True)
-        new_urls = [u for u in all_discovered if normalize_url(u) not in processed]
-        logger.info("Discovery: %d new (unprocessed) URLs after dedup", len(new_urls))
+        # Document fetching + LLM extraction (Phase 2)
+        if all_documents and not progress.cancel_token.is_set():
+            progress.status = "running_docs"
+            doc_cap = int(config.get("documents_per_run") or DOCUMENTS_PER_RUN_DEFAULT)
+            throttle.maybe_write(progress, force=True)
 
-        if new_urls:
-            url_metadata = {u: {"discovery_source": url_to_source.get(u, "auto")} for u in new_urls}
-            from api.jobs import job_store
-            job = job_store.create(new_urls, url_metadata=url_metadata)
-            scrape_job_id = job.id
-            logger.info("Discovery spawned scrape job %s for %d URLs", scrape_job_id, len(new_urls))
+            def _doc_progress(update: Dict[str, Any]) -> None:
+                # Lightweight per-document tick; orchestrator updates aggregates below
+                pass
+
+            doc_stats = fetch_documents(
+                all_documents,
+                cancel_token=progress.cancel_token,
+                per_run_cap=doc_cap,
+                progress_cb=_doc_progress,
+            )
+            progress.documents_submitted = doc_stats["submitted"]
+            progress.documents_downloaded = doc_stats["downloaded"]
+            progress.documents_extracted = doc_stats["extracted"]
+            progress.documents_skipped_dedup = doc_stats["skipped_dedup"]
+            progress.documents_errors = doc_stats["errors"]
+            progress.status = "running"
+            throttle.maybe_write(progress, force=True)
+
+        if progress.cancel_token.is_set():
+            failure = "cancelled"
+        else:
+            processed = get_processed_urls(force_refresh=True)
+            new_urls = [u for u in all_discovered if normalize_url(u) not in processed]
+            progress.urls_new = len(new_urls)
+            logger.info("Discovery: %d new (unprocessed) URLs after dedup", len(new_urls))
+
+            # Update per-source new-URL counts after global dedup
+            per_source_new: Dict[str, int] = {}
+            for u in new_urls:
+                src = url_to_source.get(u, "")
+                if src:
+                    per_source_new[src] = per_source_new.get(src, 0) + 1
+            for src_name, count in per_source_new.items():
+                progress.update_source(src_name, urls_new=count)
+            for u in new_urls[:50]:
+                progress.add_result_preview({
+                    "url": u,
+                    "funder_name": url_to_funder.get(u, ""),
+                    "source": url_to_source.get(u, ""),
+                }, cap=50)
+            throttle.maybe_write(progress, force=True)
+
+            if new_urls:
+                url_metadata = {
+                    u: {
+                        "discovery_source": url_to_source.get(u, "auto"),
+                        **({"fund_name": url_to_funder[u]} if url_to_funder.get(u) else {}),
+                    }
+                    for u in new_urls
+                }
+                from api.jobs import job_store
+                job = job_store.create(new_urls, url_metadata=url_metadata)
+                scrape_job_id = job.id
+                progress.scrape_job_id = scrape_job_id
+                logger.info("Discovery spawned scrape job %s for %d URLs", scrape_job_id, len(new_urls))
 
     except Exception as exc:
         logger.error("Discovery run %s failed: %s", run_id, exc, exc_info=True)
-        fail_run(run_id, str(exc))
-        collection_failed = True
+        failure = str(exc)
+        fail_run(run_id, failure)
+        progress.error = failure
+        progress.status = "failed"
+        progress.finished_at = time.time()
+        throttle.maybe_write(progress, force=True)
 
-    # Always attempt to save per-source state — even on partial collection failure,
-    # saving whatever progress was made prevents redundant re-queries next run.
+    # Always persist whatever per-source progress was made.
     if new_state:
         try:
             save_discovery_state({**discovery_state, **new_state})
         except Exception as exc:
             logger.warning("Could not save discovery state for run %s: %s", run_id, exc)
 
-    if not collection_failed:
+    if failure is None:
         try:
             complete_run(
                 run_id,
@@ -191,197 +481,19 @@ def run_discovery(*, trigger: str = "scheduled", run_id: str | None = None) -> s
                 urls_new=len(new_urls),
                 scrape_job_id=scrape_job_id,
             )
+            progress.status = "completed"
+            progress.finished_at = time.time()
+            throttle.maybe_write(progress, force=True)
             logger.info("Discovery run %s completed", run_id)
         except Exception as exc:
             logger.warning("Could not record completion for run %s: %s", run_id, exc)
+    elif failure == "cancelled":
+        progress.status = "cancelled"
+        progress.finished_at = time.time()
+        try:
+            fail_run(run_id, "cancelled by user")
+        except Exception:
+            pass
+        throttle.maybe_write(progress, force=True)
 
     return run_id
-
-
-# ── Source collectors ─────────────────────────────────────────────────────────
-
-
-def _collect_propublica(config: dict, state: dict) -> Tuple[List[tuple], Dict]:
-    """
-    Collect foundation URLs from ProPublica.
-
-    If config has explicit states, searches those every run.
-    Otherwise rotates through all 50 US states (5 per run) to progressively
-    discover foundations across the country.
-    """
-    from utils.US_Grant_Discovery.prospector import foundations_to_scrape_urls, search_foundations
-
-    max_per_source: int = int(config.get("max_per_source") or 100)
-    keywords_str: Optional[str] = _derive_keywords(config) or None
-    config_states = [s.upper() for s in (config.get("states") or []) if s]
-
-    if config_states:
-        states_to_query = config_states
-        new_state = state  # don't advance rotation when explicit states are configured
-    else:
-        idx = int(state.get("next_state_idx", 0))
-        states_to_query = [_US_STATES[(idx + i) % len(_US_STATES)] for i in range(_STATES_PER_RUN)]
-        new_state = {"next_state_idx": (idx + _STATES_PER_RUN) % len(_US_STATES)}
-
-    per_state_limit = max(10, max_per_source // max(len(states_to_query), 1))
-
-    collected: List[tuple] = []
-    for query_state in states_to_query:
-        try:
-            foundations = search_foundations(
-                state=query_state,
-                keywords=keywords_str,
-                max_results=per_state_limit,
-            )
-            urls = foundations_to_scrape_urls(foundations)
-            for url in urls:
-                collected.append((url, "propublica"))
-            logger.info("ProPublica: %d URLs for state=%s", len(urls), query_state)
-        except Exception as exc:
-            logger.warning("ProPublica search failed for state=%s: %s", query_state, exc)
-
-    return collected, new_state
-
-
-def _collect_grants_gov(config: dict, state: dict) -> Tuple[List[tuple], Dict]:
-    """
-    Collect federal grant URLs from Grants.gov.
-    Uses the last-run date from state to only fetch grants posted since the previous run.
-    On first run (no saved state), bootstraps with the last 30 days so we get a useful
-    initial set rather than the static all-time top-100.
-    """
-    from datetime import timedelta
-
-    from utils.US_Grant_Discovery.grants_gov_search import (
-        federal_grants_to_scrape_urls,
-        search_federal_grants,
-    )
-
-    max_per_source: int = int(config.get("max_per_source") or 100)
-    keywords_str = _derive_keywords(config)
-    today = datetime.now(timezone.utc).date()
-    today_str = today.isoformat()
-
-    last_posted = state.get("last_posted_from")
-    if not last_posted:
-        # First run — bootstrap with last 30 days so results are fresh, not static
-        last_posted = (today - timedelta(days=30)).isoformat()
-
-    collected: List[tuple] = []
-    try:
-        grants = search_federal_grants(
-            keywords=keywords_str,
-            eligible_applicants=["12"],  # 501(c)(3) nonprofits
-            posted_from=last_posted,
-            max_results=max_per_source,
-        )
-        urls = federal_grants_to_scrape_urls(grants)
-        for url in urls:
-            collected.append((url, "grants_gov"))
-        logger.info("Grants.gov: %d URLs (posted since %s)", len(urls), last_posted)
-    except Exception as exc:
-        logger.warning("Grants.gov search failed: %s", exc)
-
-    return collected, {"last_posted_from": today_str}
-
-
-def _collect_sam_gov(config: dict, state: dict) -> Tuple[List[tuple], Dict]:
-    """
-    Collect federal opportunity URLs from SAM.gov.
-    Requires a SAM.gov API key in the api_tokens table.
-    Uses the last-run date from state to only fetch recently posted notices.
-    """
-    from utils.discovery.sources.sam_gov import sam_gov_to_scrape_urls, search_sam_gov
-
-    api_key = _get_api_key("sam_gov")
-    if not api_key:
-        logger.warning("SAM.gov: no API key found in api_tokens, skipping")
-        return [], state
-
-    last_posted = state.get("last_posted_from")
-    today = datetime.now(timezone.utc).date().isoformat()
-    max_per_source: int = int(config.get("max_per_source") or 100)
-    keywords_str = _derive_keywords(config)
-
-    collected: List[tuple] = []
-    try:
-        opportunities = search_sam_gov(
-            keywords=keywords_str,
-            api_key=api_key,
-            posted_from=last_posted,
-            max_results=max_per_source,
-        )
-        urls = sam_gov_to_scrape_urls(opportunities)
-        for url in urls:
-            collected.append((url, "sam_gov"))
-        logger.info("SAM.gov: %d URLs (posted since %s)", len(urls), last_posted or "30 days default")
-    except Exception as exc:
-        logger.warning("SAM.gov search failed: %s", exc)
-
-    return collected, {"last_posted_from": today}
-
-
-def _collect_web_search(config: dict, state: dict) -> Tuple[List[tuple], Dict]:
-    """
-    Collect grant URLs via web search (Brave Search API or DuckDuckGo fallback).
-    Rotates through 5 targeted queries across runs.
-    """
-    from utils.discovery.sources.web_search import search_web_for_grants
-
-    brave_key = _get_api_key("brave_search")
-    keywords_str = _derive_keywords(config)
-    query_idx = int(state.get("query_idx", 0))
-    today = datetime.now(timezone.utc).date().isoformat()
-
-    org = _get_org_profile()
-    org_state: Optional[str] = (org.get("state") or "").strip().upper() or None
-
-    collected: List[tuple] = []
-    next_idx = (query_idx + 1) % 5
-    try:
-        urls, next_idx = search_web_for_grants(
-            keywords=keywords_str,
-            brave_api_key=brave_key,
-            query_idx=query_idx,
-            org_state=org_state,
-        )
-        for url in urls:
-            collected.append((url, "web_search"))
-        logger.info("Web search: %d URLs (query_idx=%d)", len(urls), query_idx)
-    except Exception as exc:
-        logger.warning("Web search failed: %s", exc)
-
-    return collected, {"query_idx": next_idx, "last_run_date": today}
-
-
-def _collect_federal_register(config: dict, state: dict) -> Tuple[List[tuple], Dict]:
-    """
-    Collect grant notice URLs from the Federal Register.
-    Uses the Federal Register public API (no key required) to find
-    recently published NOFAs and funding competition notices.
-    """
-    from utils.discovery.sources.federal_register import (
-        federal_register_to_scrape_urls,
-        fetch_federal_register_grants,
-    )
-
-    since_date = state.get("last_posted_from")
-    today = datetime.now(timezone.utc).date().isoformat()
-    keywords_str = _derive_keywords(config)
-    max_per_source: int = int(config.get("max_per_source") or 100)
-
-    collected: List[tuple] = []
-    try:
-        docs = fetch_federal_register_grants(
-            keywords=keywords_str,
-            since_date=since_date,
-            max_results=max_per_source,
-        )
-        urls = federal_register_to_scrape_urls(docs)
-        for url in urls:
-            collected.append((url, "federal_register"))
-        logger.info("Federal Register: %d URLs (since %s)", len(urls), since_date or "30 days")
-    except Exception as exc:
-        logger.warning("Federal Register fetch failed: %s", exc)
-
-    return collected, {"last_posted_from": today}

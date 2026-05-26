@@ -94,3 +94,8 @@ _archive/
 
 # Broken environments
 .venv-broken/
+
+# LLM + scrape debug logs
+logs/
+page*
+.superpowers*

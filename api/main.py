@@ -12,6 +12,7 @@ from api.config import settings
 from api.routes import admin, health, results, scrape
 from api.routes import settings as settings_router
 from api.routes import discovery as discovery_router
+from api.routes import stats as stats_router
 
 
 @asynccontextmanager
@@ -42,6 +43,7 @@ def create_app() -> FastAPI:
     app.include_router(settings_router.router)
     app.include_router(admin.router)
     app.include_router(discovery_router.router)
+    app.include_router(stats_router.router)
 
     return app
 
