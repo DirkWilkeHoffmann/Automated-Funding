@@ -319,24 +319,13 @@ def stage2_evaluate(
 
 
 def call_llm_extract(text: str, fund_url: str = "") -> Dict[str, Any]:
-    """
-    Extract funding information from text using a two-phase prompt.
+    """Orchestrate Stage 1 extraction → geography check → Stage 2 evaluation → Phase 2 enrichment.
 
-      Phase 1 (always): cheap triage — verdict + all structured fields,
-                        one-sentence evidence. Uses operator's saved prompt
-                        if configured, else the default LLM_PROMPT.
-      Phase 2 (conditional): only if Phase 1 eligibility ∈ PHASE2_PROMOTE_TIERS
-                            and the source text has enough body to enrich
-                            from. Adds past-grantee citations with amounts,
-                            inferred grant size, application process specifics,
-                            strategic angle, real concerns, and a concrete
-                            next-step action. Output is concatenated into the
-                            evidence field; no other fields are overwritten.
-
-    Falls back to gpt-4.1 for Phase 1 if the fast model returns thin results
-    (same behaviour as before the split).
+    Public API unchanged. Stage 1 extracts fund facts without org data (eliminates template
+    echo). Python checks geography deterministically. Stage 2 evaluates eligibility from
+    clean facts + org profile.
     """
-    from utils.constants.llm import PHASE2_PROMOTE_TIERS
+    from utils.constants.llm import ELIGIBILITY_ORDER, PHASE2_PROMOTE_TIERS
 
     client = get_client()
     if client is None:
@@ -347,58 +336,74 @@ def call_llm_extract(text: str, fund_url: str = "") -> Dict[str, Any]:
         half = _MAX_CHARS // 2
         text = text[:half] + "\n...[content truncated]...\n" + text[-half:]
 
-    org_profile = get_org_profile_text()
-    from utils.db.org_store import get_prompt_templates, _get_org_cached
-    system_prompt, user_prompt_template = get_prompt_templates()
-    prompt = user_prompt_template.format(org_profile=org_profile, text=text)
+    # ── Stage 1: fact extraction (no org profile in prompt) ───────────────
+    s1 = stage1_extract(text, client=client, fund_url=fund_url)
 
-    # Load the raw org data for the deterministic geography validator.
+    # ── Deterministic geography check ─────────────────────────────────────
+    from utils.db.org_store import get_prompt_templates, _get_org_cached
     _org = _get_org_cached() or {}
     _svc_countries = [str(c).strip() for c in (_org.get("service_countries") or []) if str(c).strip()]
     _svc_regions: Dict[str, list] = _org.get("service_regions") or {}
-
-    # ── Phase 1 — triage ───────────────────────────────────────────────────
-    result = _call_model(client, prompt, _MODEL_FAST, system_prompt=system_prompt, fund_url=fund_url)
-    if _is_thin_result(result) and len(text) > 2000:
-        log_message(f"Thin result from {_MODEL_FAST}; retrying with {_MODEL_FULL}", "warning")
-        result = _call_model(client, prompt, _MODEL_FULL, system_prompt=system_prompt, fund_url=fund_url)
-
-    # ── Deterministic geography override ──────────────────────────────────
-    # LLMs cannot reliably cross-reference a multi-field org profile against
-    # fund text. Geography matching is pure set-intersection — we always
-    # override the LLM's rubric.geography verdict with the Python result.
     geo_verdict = _compute_geography_verdict(
-        str(result.get("geographic_scope", "") or ""),
+        str(s1.get("geographic_scope", "") or ""),
         service_countries=_svc_countries,
         service_regions=_svc_regions,
     )
-    new_rubric = {**(result.get("match_rubric") or {}), "geography": geo_verdict}
-    new_tier = _tier_from_rubric(new_rubric)
-    from utils.constants.llm import ELIGIBILITY_ORDER
-    result = {
-        **result,
-        "match_rubric": new_rubric,
-        "eligibility": new_tier if new_tier in ELIGIBILITY_ORDER else result.get("eligibility", "Low Match"),
-    }
 
-    # ── Phase 2 — rich enrichment (only for funds worth pursuing) ──────────
-    tier = result.get("eligibility", "Low Match")
+    # ── Stage 2: eligibility evaluation (clean facts + org profile) ───────
+    org_profile = get_org_profile_text()
+    system_prompt, _ = get_prompt_templates()
+    s2 = stage2_evaluate(s1, org_profile, geo_verdict, client=client, fund_url=fund_url)
+
+    # ── Merge geography verdict + derive deterministic tier ────────────────
+    rubric = {**_normalize_rubric(s2.get("match_rubric")), "geography": geo_verdict}
+    tier = _tier_from_rubric(rubric)
+    if tier not in ELIGIBILITY_ORDER:
+        tier = "Low Match"
+
+    # ── Phase 2 enrichment (only for promising tiers) ─────────────────────
+    evidence = s2.get("evidence", "")
     if tier in PHASE2_PROMOTE_TIERS and len(text) > 2000:
         phase2 = _phase2_enrich(
             client,
             text=text,
             org_profile=org_profile,
-            phase1_result=result,
+            phase1_result={"evidence": evidence, "eligibility": tier},
             system_prompt=system_prompt,
             fund_url=fund_url,
         )
         if phase2:
-            # Replace the one-liner with the full rich evidence block.
-            result["evidence"] = _format_rich_evidence(
-                phase1_evidence=result.get("evidence", ""),
+            evidence = _format_rich_evidence(
+                phase1_evidence=evidence,
                 tier=tier,
                 phase2=phase2,
             )
+
+    # ── Flatten Stage 1 lists → semicolon strings (existing DB schema) ────
+    def _join_list(v) -> str:
+        if isinstance(v, list):
+            return "; ".join(str(x) for x in v if x)
+        return str(v or "")
+
+    result: Dict[str, Any] = {
+        "applicant_types": _join_list(s1.get("applicant_types_list")),
+        "geographic_scope": s1.get("geographic_scope", ""),
+        "us_state_scope": _join_list(s1.get("us_state_scope")),
+        "beneficiary_focus": _join_list(s1.get("beneficiaries_list")),
+        "funding_range": s1.get("funding_range", ""),
+        "restrictions": _join_list(s1.get("restrictions_list")),
+        "application_status": s1.get("application_status", "unclear"),
+        "deadline": s1.get("deadline", ""),
+        "notes": s1.get("notes", ""),
+        "grant_type": s1.get("grant_type", "other"),
+        "funder_name": s1.get("funder_name", ""),
+        "stage1_fund_name": s1.get("fund_name_extracted", ""),
+        "match_rubric": rubric,
+        "eligibility": tier,
+        "evidence": evidence,
+    }
+    if result["eligibility"] not in ELIGIBILITY_ORDER:
+        result["eligibility"] = "Low Match"
     return result
 
 
@@ -458,12 +463,18 @@ def _format_rich_evidence(*, phase1_evidence: str, tier: str, phase2: Dict[str, 
     """Concatenate Phase 1 verdict + Phase 2 structured enrichment into a single text block."""
     lines: list[str] = []
 
-    # VERDICT — reuse phase1's one-liner so the verdict source-of-truth stays single
-    verdict_line = phase1_evidence.strip() or f"VERDICT: {tier}"
-    if not verdict_line.upper().startswith("VERDICT"):
-        verdict_line = f"VERDICT: {verdict_line}"
+    # VERDICT — always use the deterministic tier; extract reason from phase1_evidence
+    _p1 = phase1_evidence.strip()
+    _reason = ""
+    if " — " in _p1:
+        _reason = _p1.split(" — ", 1)[1].strip()
+    elif _p1.upper().startswith("VERDICT:"):
+        rest = _p1[len("VERDICT:"):].strip()
+        if " — " in rest:
+            _reason = rest.split(" — ", 1)[1].strip()
+    verdict_line = tier + (f" — {_reason}" if _reason else "")
     lines.append("=== VERDICT ===")
-    lines.append(verdict_line.removeprefix("VERDICT:").removeprefix(" VERDICT:").strip() or tier)
+    lines.append(verdict_line)
     lines.append("")
 
     # WHY IT FITS
