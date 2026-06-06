@@ -462,3 +462,29 @@ BEGIN
     END LOOP;
 END
 $$;
+
+-- ============================================================
+-- pending_urls: listing-page sub-URLs awaiting user review
+-- before scraping begins (2026-06-06)
+-- ============================================================
+-- When the discovery pipeline encounters a listing page it may
+-- find many sub-URLs that are candidates for scraping. Rather
+-- than immediately scraping them all, they are queued here so a
+-- human admin can approve or reject each one before scraping
+-- starts. Approved URLs are enqueued into a scrape_jobs batch.
+CREATE TABLE IF NOT EXISTS pending_urls (
+  id            uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  url           text        NOT NULL UNIQUE,
+  title         text,
+  source_url    text,
+  status        text        NOT NULL DEFAULT 'awaiting_review',
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now(),
+  approved_by   uuid        REFERENCES auth.users(id),
+  scrape_job_id text        REFERENCES scrape_jobs(id),
+  CONSTRAINT pending_urls_status_check
+    CHECK (status IN ('awaiting_review', 'approved', 'rejected', 'scraped'))
+);
+
+CREATE INDEX IF NOT EXISTS pending_urls_status_idx     ON pending_urls(status);
+CREATE INDEX IF NOT EXISTS pending_urls_source_url_idx ON pending_urls(source_url);
