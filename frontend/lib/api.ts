@@ -197,7 +197,34 @@ export const api = {
     const qs = params.toString();
     return request<DatasetBrowse>(`/discovery/datasets/${name}${qs ? "?" + qs : ""}`);
   },
+
+  // Pending URLs
+  adminListPendingUrls: () =>
+    request<PendingUrlItem[]>("/admin/pending-urls"),
+  adminPendingCount: () =>
+    request<{ count: number }>("/admin/pending-urls/count"),
+  adminApprovePendingUrls: (ids: string[]) =>
+    request<{ job_id: string; url_count: number; urls: string[] }>("/admin/pending-urls/approve", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    }),
+  adminRejectPendingUrls: (ids: string[]) =>
+    request<{ rejected: number }>("/admin/pending-urls/reject", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    }),
 };
+
+// ── Pending URL shape ─────────────────────────────────────────────────────────
+
+export interface PendingUrlItem {
+  id: string;
+  url: string;
+  title?: string;
+  source_url?: string;
+  status: string;
+  created_at?: string;
+}
 
 // ── Import status shape ──────────────────────────────────────────────────────
 

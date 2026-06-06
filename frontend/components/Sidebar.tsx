@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import {
   BarChart3,
   Building2,
+  Clock,
   Key,
   LayoutDashboard,
   LogOut,
@@ -33,6 +34,7 @@ const ADMIN_ITEMS: NavItem[] = [
   { href: "/admin/organisation", label: "Organisation & AI", icon: Building2 },
   { href: "/admin/users", label: "Users", icon: Users },
   { href: "/admin/keys", label: "API Keys", icon: Key },
+  { href: "/admin/pending", label: "Pending URLs", icon: Clock },
   { href: "/discovery", label: "Auto-Discovery", icon: Radar },
 ];
 
