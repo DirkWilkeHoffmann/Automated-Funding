@@ -451,7 +451,7 @@ DECLARE
         'funds', 'scrape_jobs', 'scrape_job_urls', 'organizations',
         'user_profiles', 'api_tokens', 'irs_990_index',
         'irs_990_index_refresh', 'documents', 'discovery_funders',
-        'grant_opportunities', 'sam_cfda_listings'
+        'grant_opportunities', 'sam_cfda_listings', 'pending_urls'
     ];
 BEGIN
     FOREACH tbl IN ARRAY target_tables
