@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+from typing import List
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from api import dependencies
-from api.schemas import ApprovePendingRequest, RejectPendingRequest
+from api.schemas import ApprovePendingRequest, PendingUrlItem, RejectPendingRequest
 from utils.db.pending_urls_store import (
     approve_batch,
     list_pending,
@@ -18,7 +20,7 @@ from utils.db.pending_urls_store import (
 router = APIRouter(prefix="/admin/pending-urls", tags=["pending-urls"])
 
 
-@router.get("")
+@router.get("", response_model=List[PendingUrlItem])
 async def list_pending_urls(user=Depends(dependencies.require_superuser)):
     """Return all awaiting_review pending URLs."""
     return list_pending(status="awaiting_review")
@@ -36,19 +38,16 @@ async def approve_pending_urls(body: ApprovePendingRequest, user=Depends(depende
     if not body.ids:
         raise HTTPException(status_code=400, detail="No ids provided")
 
-    urls = approve_batch(body.ids, user_id=str(user.id) if hasattr(user, "id") else None)
+    urls = approve_batch(body.ids, user_id=str(user.id))
     if not urls:
         raise HTTPException(status_code=404, detail="No matching pending URLs found")
 
-    from api.jobs import JobStore
-    from utils.scrape_worker import start_background_scrape
+    from api.jobs import job_store
 
-    job_id = JobStore.create(urls)
-    progress = start_background_scrape(urls, job_id=job_id)
-    JobStore.attach(job_id, progress)
-    mark_scraped(body.ids, scrape_job_id=job_id)
+    job = job_store.create(urls)
+    mark_scraped(body.ids, scrape_job_id=job.id)
 
-    return {"job_id": job_id, "url_count": len(urls), "urls": urls}
+    return {"job_id": job.id, "url_count": len(urls), "urls": urls}
 
 
 @router.post("/reject")
