@@ -254,6 +254,7 @@ def stage2_evaluate(
     *,
     client: "OpenAI",
     fund_url: str = "",
+    system_prompt: str = "",
 ) -> Dict[str, Any]:
     """Stage 2: score eligibility rubric from Stage 1 facts + org profile."""
     from utils.constants.llm import LLM_PROMPT_STAGE2, LLM_SYSTEM_PROMPT
@@ -286,7 +287,7 @@ def stage2_evaluate(
         resp = client.chat.completions.create(
             model=_MODEL_FULL,
             messages=[
-                {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt or LLM_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
             temperature=0,
@@ -331,13 +332,12 @@ def call_llm_extract(text: str, fund_url: str = "") -> Dict[str, Any]:
     if client is None:
         return _empty_result("LLM not configured (no API key).", "LLM extraction skipped.")
 
-    if len(text) > _MAX_CHARS:
-        log_message(f"Text truncated from {len(text)} to {_MAX_CHARS} chars", "warning")
-        half = _MAX_CHARS // 2
-        text = text[:half] + "\n...[content truncated]...\n" + text[-half:]
-
     # ── Stage 1: fact extraction (no org profile in prompt) ───────────────
+    # (stage1_extract handles text truncation internally)
     s1 = stage1_extract(text, client=client, fund_url=fund_url)
+    if not any(s1.get(k) for k in ("fund_name_extracted", "geographic_scope", "topic_areas")):
+        log_message(f"Stage 1 returned empty result for {fund_url}; aborting extraction", "warning")
+        return _empty_result("Stage 1 extraction failed.", "Stage 1 returned no usable data.")
 
     # ── Deterministic geography check ─────────────────────────────────────
     from utils.db.org_store import get_prompt_templates, _get_org_cached
@@ -353,7 +353,7 @@ def call_llm_extract(text: str, fund_url: str = "") -> Dict[str, Any]:
     # ── Stage 2: eligibility evaluation (clean facts + org profile) ───────
     org_profile = get_org_profile_text()
     system_prompt, _ = get_prompt_templates()
-    s2 = stage2_evaluate(s1, org_profile, geo_verdict, client=client, fund_url=fund_url)
+    s2 = stage2_evaluate(s1, org_profile, geo_verdict, client=client, fund_url=fund_url, system_prompt=system_prompt)
 
     # ── Merge geography verdict + derive deterministic tier ────────────────
     rubric = {**_normalize_rubric(s2.get("match_rubric")), "geography": geo_verdict}
@@ -464,13 +464,13 @@ def _format_rich_evidence(*, phase1_evidence: str, tier: str, phase2: Dict[str, 
     """Concatenate Phase 1 verdict + Phase 2 structured enrichment into a single text block."""
     lines: list[str] = []
 
-    # VERDICT — always use the deterministic tier; extract reason from phase1_evidence
-    _p1 = phase1_evidence.strip()
+    # VERDICT — always use the deterministic tier; extract reason from first line only
+    _p1_first = (phase1_evidence or "").strip().splitlines()[0] if phase1_evidence else ""
     _reason = ""
-    if " — " in _p1:
-        _reason = _p1.split(" — ", 1)[1].strip()
-    elif _p1.upper().startswith("VERDICT:"):
-        rest = _p1[len("VERDICT:"):].strip()
+    if " — " in _p1_first:
+        _reason = _p1_first.split(" — ", 1)[1].strip()
+    elif _p1_first.upper().startswith("VERDICT:"):
+        rest = _p1_first[len("VERDICT:"):].strip()
         if " — " in rest:
             _reason = rest.split(" — ", 1)[1].strip()
     verdict_line = tier + (f" — {_reason}" if _reason else "")
