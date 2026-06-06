@@ -62,6 +62,30 @@ def _word_count(text: str) -> int:
     return len(text.split())
 
 
+def playwright_fetch(url: str) -> Optional[str]:
+    """Fetch a URL with headless Chromium, waiting for JS to render.
+
+    Returns raw HTML string, or None on failure or missing dependency.
+    Only call this when BS4 extraction yields fewer than _PLAYWRIGHT_WORD_THRESHOLD words.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log_message("playwright not installed — skipping JS render fallback", "warning")
+        return None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            content = page.content()
+            browser.close()
+            return content
+    except Exception as exc:
+        log_message(f"Playwright fetch failed for {url}: {exc}", "warning")
+        return None
+
+
 def _is_safe_url(url: str) -> bool:
     """Return True only when the URL is safe to fetch.
 
@@ -376,6 +400,20 @@ def prioritized_crawl(seed_url: str) -> Tuple[str, str, int, List[str], Dict[str
         if not html:
             continue
         text = extract_visible_text(html)
+        if _word_count(text) < _PLAYWRIGHT_WORD_THRESHOLD:
+            log_message(
+                f"Thin BS4 result ({_word_count(text)} words) for {url}; trying Playwright",
+                "info",
+            )
+            pw_html = playwright_fetch(url)
+            if pw_html:
+                pw_text = extract_visible_text(pw_html)
+                if _word_count(pw_text) > _word_count(text):
+                    log_message(
+                        f"Playwright improved extraction to {_word_count(pw_text)} words for {url}",
+                        "info",
+                    )
+                    text = pw_text
         all_text.append(text)
         fname = safe_filename_from_url(url) + ".txt"
         with open(os.path.join(domain_folder, fname), "w", encoding="utf-8") as f:
