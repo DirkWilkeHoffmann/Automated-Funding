@@ -114,5 +114,6 @@ def pending_count() -> int:
             .execute()
         )
         return result.count or 0
-    except Exception:
+    except Exception as exc:
+        logger.warning("pending_count failed: %s", exc)
         return 0
