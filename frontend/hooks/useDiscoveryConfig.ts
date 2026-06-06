@@ -7,14 +7,12 @@ export type DiscoverySources = {
   propublica: boolean;
   grants_gov: boolean;
   sam_gov: boolean;
-  web_search: boolean;
   federal_register: boolean;
   state_portals: boolean;
-  usaspending: boolean;
   candid: boolean;
-  philanthropy_digest: boolean;
   irs_bmf: boolean;
   grants_gov_db: boolean;
+  sam_cfda_db: boolean;
 };
 
 export type ImportConfig = {
@@ -22,8 +20,15 @@ export type ImportConfig = {
   bmf_ntee_prefixes: string[];
   bmf_batch_size: number;
   grants_gov_close_days: number;
+  grants_gov_nonprofit_filter: boolean;
+  bmf_cron: string;
+  irs_990_index_cron: string;
+  grants_gov_cron: string;
+  sam_cfda_cron: string;
   bmf_last_imported_at: string | null;
   grants_gov_last_imported_at: string | null;
+  sam_cfda_last_imported_at: string | null;
+  irs_990_index_last_imported_at: string | null;
 };
 
 export type DiscoveryConfig = {
@@ -45,14 +50,12 @@ export const DEFAULT_SOURCES: DiscoverySources = {
   propublica: true,
   grants_gov: true,
   sam_gov: false,
-  web_search: true,
   federal_register: true,
   state_portals: true,
-  usaspending: false,
   candid: false,
-  philanthropy_digest: false,
   irs_bmf: true,
   grants_gov_db: true,
+  sam_cfda_db: true,
 };
 
 const DEFAULT_IMPORT_CONFIG: ImportConfig = {
@@ -60,8 +63,15 @@ const DEFAULT_IMPORT_CONFIG: ImportConfig = {
   bmf_ntee_prefixes: [],
   bmf_batch_size: 50,
   grants_gov_close_days: 90,
+  grants_gov_nonprofit_filter: true,
+  bmf_cron: "0 3 * * 0",
+  irs_990_index_cron: "0 4 * * 0",
+  grants_gov_cron: "0 5 * * *",
+  sam_cfda_cron: "0 6 * * 0",
   bmf_last_imported_at: null,
   grants_gov_last_imported_at: null,
+  sam_cfda_last_imported_at: null,
+  irs_990_index_last_imported_at: null,
 };
 
 const DEFAULT_CONFIG: DiscoveryConfig = {

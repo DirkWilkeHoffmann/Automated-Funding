@@ -72,7 +72,7 @@ def search_sam_gov(
             "postedTo": posted_to,
             "limit": page_size,
             "offset": page * page_size,
-            "ptype": "o,p,k,r,s",  # presolicitation, sources sought, combined synopsis, etc.
+            "ptype": "g",  # grants only (not procurement contracts)
         }
         try:
             resp = requests.get(_SAM_GOV_SEARCH_URL, params=params, timeout=20)
@@ -96,6 +96,7 @@ def search_sam_gov(
             resource_links = opp.get("resourceLinks") or []
             if not isinstance(resource_links, list):
                 resource_links = []
+            description = opp.get("description", "") or opp.get("synopsis", "") or ""
             results.append({
                 "opportunity_id": notice_id,
                 "title": title,
@@ -103,6 +104,9 @@ def search_sam_gov(
                 "posted_date": opp.get("postedDate", ""),
                 "close_date": opp.get("responseDeadLine", ""),
                 "opportunity_type": opp.get("type", ""),
+                "naics_code": opp.get("naicsCode", ""),
+                "set_aside_type": opp.get("typeOfSetAsideDescription", ""),
+                "description": description,
                 "opportunity_url": (
                     f"https://sam.gov/opp/{notice_id}/view"
                     if notice_id

@@ -19,6 +19,7 @@ CSV_COLUMNS = [
     "grant_type",
     "eligibility",
     "evidence",
+    "match_rubric",
     "pages_scraped",
     "visited_urls_count",
     "pdf_read",

@@ -10,13 +10,19 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from api import dependencies
 from api.schemas import (
+    APIKeyHealth,
+    DatasetBrowseResponse,
     DiscoveryConfigRequest,
     DiscoveryConfigResponse,
+    DiscoveryHealthResponse,
     DiscoveryImportStatusResponse,
     DiscoveryProgressResponse,
     DiscoveryRunResponse,
     DiscoverySourceProgress,
     ImportConfig,
+    PreFilterFunnel,
+    PreFilterFunnelStage,
+    PreFilterPreviewResponse,
 )
 from utils.discovery.config_store import load_config, save_config
 from utils.discovery.progress_registry import progress_registry
@@ -40,14 +46,12 @@ def _serialize_config(row: dict) -> DiscoveryConfigResponse:
             "propublica": bool(sources_raw.get("propublica", True)),
             "grants_gov": bool(sources_raw.get("grants_gov", True)),
             "sam_gov": bool(sources_raw.get("sam_gov", False)),
-            "web_search": bool(sources_raw.get("web_search", True)),
             "federal_register": bool(sources_raw.get("federal_register", True)),
             "state_portals": bool(sources_raw.get("state_portals", True)),
-            "usaspending": bool(sources_raw.get("usaspending", False)),
             "candid": bool(sources_raw.get("candid", False)),
-            "philanthropy_digest": bool(sources_raw.get("philanthropy_digest", False)),
             "irs_bmf": bool(sources_raw.get("irs_bmf", True)),
             "grants_gov_db": bool(sources_raw.get("grants_gov_db", True)),
+            "sam_cfda_db": bool(sources_raw.get("sam_cfda_db", True)),
         },
         max_per_source=int(row.get("max_per_source") or 100),
         documents_per_run=int(row.get("documents_per_run") or 200),
@@ -56,8 +60,15 @@ def _serialize_config(row: dict) -> DiscoveryConfigResponse:
             bmf_ntee_prefixes=import_cfg_raw.get("bmf_ntee_prefixes") or [],
             bmf_batch_size=int(import_cfg_raw.get("bmf_batch_size") or 50),
             grants_gov_close_days=int(import_cfg_raw.get("grants_gov_close_days") or 90),
+            grants_gov_nonprofit_filter=bool(import_cfg_raw.get("grants_gov_nonprofit_filter", True)),
+            bmf_cron=import_cfg_raw.get("bmf_cron") or "0 3 * * 0",
+            irs_990_index_cron=import_cfg_raw.get("irs_990_index_cron") or "0 4 * * 0",
+            grants_gov_cron=import_cfg_raw.get("grants_gov_cron") or "0 5 * * *",
+            sam_cfda_cron=import_cfg_raw.get("sam_cfda_cron") or "0 6 * * 0",
             bmf_last_imported_at=import_cfg_raw.get("bmf_last_imported_at"),
             grants_gov_last_imported_at=import_cfg_raw.get("grants_gov_last_imported_at"),
+            sam_cfda_last_imported_at=import_cfg_raw.get("sam_cfda_last_imported_at"),
+            irs_990_index_last_imported_at=import_cfg_raw.get("irs_990_index_last_imported_at"),
         ),
         updated_at=row.get("updated_at"),
     )
@@ -93,9 +104,11 @@ def update_config(
     payload: DiscoveryConfigRequest,
     user=Depends(dependencies.require_superuser),
 ):
-    """Save discovery config. Dynamically reschedules the APScheduler job if cron changed."""
+    """Save discovery config. Dynamically reschedules the APScheduler jobs
+    if any cron expression changed (discovery cron OR per-dataset import crons)."""
     old_config = load_config()
     old_cron = old_config.get("cron_expression") or "0 2 * * 1"
+    old_import = old_config.get("import_config") or {}
 
     data = payload.model_dump()
     data["sources"] = payload.sources.model_dump()
@@ -109,6 +122,16 @@ def update_config(
             reschedule_discovery(new_cron)
         except Exception as exc:
             logger.warning("Could not reschedule discovery job: %s", exc)
+
+    # Reschedule per-dataset import jobs if any of their cron expressions changed.
+    new_import = data.get("import_config") or {}
+    cron_keys = ("bmf_cron", "irs_990_index_cron", "grants_gov_cron", "sam_cfda_cron")
+    if any(new_import.get(k) != old_import.get(k) for k in cron_keys):
+        try:
+            from utils.discovery.scheduler import reschedule_imports
+            reschedule_imports()
+        except Exception as exc:
+            logger.warning("Could not reschedule import jobs: %s", exc)
 
     return _serialize_config(saved)
 
@@ -324,6 +347,40 @@ def trigger_grants_gov_import(user=Depends(dependencies.require_superuser)):
     return {"status": "started", "message": "Grants.gov XML import started in background"}
 
 
+@router.post("/import/irs-990-index", status_code=202)
+def trigger_irs_990_index_import(user=Depends(dependencies.require_superuser)):
+    """Trigger an IRS 990 e-file index refresh (current + previous year)."""
+    def _run() -> None:
+        try:
+            from datetime import datetime, timezone
+            from utils.discovery.sources.irs_990_index import refresh_index_for_year
+            current_year = datetime.now(timezone.utc).year
+            for year in (current_year - 1, current_year):
+                try:
+                    refresh_index_for_year(year, force=True)
+                except Exception as exc:
+                    logger.warning("990 index refresh for %s failed: %s", year, exc)
+        except Exception as exc:
+            logger.error("IRS 990 index import failed: %s", exc, exc_info=True)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "started", "message": "IRS 990 e-file index refresh started in background"}
+
+
+@router.post("/import/sam-cfda", status_code=202)
+def trigger_sam_cfda_import(user=Depends(dependencies.require_superuser)):
+    """Trigger a SAM.gov Assistance Listings (CFDA) refresh in a background thread."""
+    def _run() -> None:
+        try:
+            from utils.discovery.importers.sam_cfda import run_sam_cfda_import
+            run_sam_cfda_import()
+        except Exception as exc:
+            logger.error("SAM.gov CFDA import failed: %s", exc, exc_info=True)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "started", "message": "SAM.gov CFDA import started in background"}
+
+
 @router.get("/import/status", response_model=DiscoveryImportStatusResponse)
 def get_import_status(user=Depends(dependencies.require_superuser)):
     """Return last import timestamps and row counts for BMF and Grants.gov databases."""
@@ -372,11 +429,219 @@ def get_import_status(user=Depends(dependencies.require_superuser)):
     except Exception:
         opp_open = 0
 
+    try:
+        sam_total = (
+            get_supabase().table("sam_cfda_listings").select("program_number", count="exact").execute().count or 0
+        )
+    except Exception:
+        # Table may not exist yet (Phase 1 migration deferred) — count of 0 is the right signal.
+        sam_total = 0
+
+    try:
+        irs_total = (
+            get_supabase().table("irs_990_index").select("ein", count="exact").execute().count or 0
+        )
+    except Exception:
+        irs_total = 0
+
     return DiscoveryImportStatusResponse(
         bmf_last_imported_at=import_cfg.get("bmf_last_imported_at"),
         grants_gov_last_imported_at=import_cfg.get("grants_gov_last_imported_at"),
+        sam_cfda_last_imported_at=import_cfg.get("sam_cfda_last_imported_at"),
+        irs_990_index_last_imported_at=import_cfg.get("irs_990_index_last_imported_at"),
         bmf_funders_total=bmf_total,
         bmf_funders_unscraped=bmf_unscraped,
         grant_opportunities_total=opp_total,
         grant_opportunities_open=opp_open,
+        sam_cfda_total=sam_total,
+        irs_990_index_total=irs_total,
+    )
+
+
+# ── Health: API-key status + org-profile completeness ───────────────────────
+
+
+def _api_key_status(service: str, *, validate_fn=None) -> APIKeyHealth:
+    """Look up an api_tokens row + optionally cheap-test the key."""
+    from utils.db.client import get_supabase
+    try:
+        rows = (
+            get_supabase()
+            .table("api_tokens")
+            .select("key_value, updated_at")
+            .eq("service", service)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as exc:
+        return APIKeyHealth(name=service, status="unknown", detail=str(exc))
+    if not rows or not (rows[0].get("key_value") or "").strip():
+        return APIKeyHealth(name=service, status="missing")
+    key = rows[0]["key_value"]
+    if validate_fn is None:
+        return APIKeyHealth(name=service, status="ok")
+    try:
+        ok, detail = validate_fn(key)
+        return APIKeyHealth(name=service, status="ok" if ok else "invalid", detail=detail)
+    except Exception as exc:
+        return APIKeyHealth(name=service, status="invalid", detail=str(exc))
+
+
+def _validate_openai(key: str):
+    """Cheap probe — list the first model. 401 = invalid; anything else = ok."""
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=key)
+        # /models is one of the cheapest authenticated endpoints.
+        next(iter(client.models.list()), None)
+        return True, None
+    except Exception as exc:
+        msg = str(exc)
+        if "401" in msg or "Incorrect API key" in msg or "invalid_api_key" in msg:
+            return False, "Authentication failed (401)"
+        # Network errors etc. — don't claim invalid, just unknown
+        return True, f"Could not fully validate: {msg[:80]}"
+
+
+@router.get("/health", response_model=DiscoveryHealthResponse)
+def get_discovery_health(user=Depends(dependencies.require_superuser)):
+    """API key + org-profile completeness check. Cheap auth-probes per key."""
+    keys = [
+        _api_key_status("openai", validate_fn=_validate_openai),
+        _api_key_status("brave_search"),
+        _api_key_status("sam_gov"),
+        _api_key_status("candid"),
+    ]
+
+    # Org-profile completeness — which Phase 3 fields are missing?
+    from utils.db.client import get_supabase
+    missing: list[str] = []
+    org_complete = False
+    try:
+        rows = get_supabase().table("organizations").select("*").limit(1).execute().data or []
+        org = rows[0] if rows else {}
+        if not org.get("service_states") and not org.get("state"):
+            missing.append("service_states")
+        if not org.get("ntee_codes"):
+            missing.append("ntee_codes")
+        if "accepts_unsolicited" not in org or org.get("accepts_unsolicited") is None:
+            missing.append("accepts_unsolicited")
+        if not org.get("applicant_types"):
+            missing.append("applicant_types")
+        org_complete = not missing
+    except Exception as exc:
+        logger.debug("org-profile completeness check failed: %s", exc)
+
+    return DiscoveryHealthResponse(
+        keys=keys,
+        org_profile_complete=org_complete,
+        org_profile_missing=missing,
+    )
+
+
+# ── Pre-filter preview ──────────────────────────────────────────────────────
+
+
+@router.get("/prefilter-preview", response_model=PreFilterPreviewResponse)
+def get_prefilter_preview(user=Depends(dependencies.require_superuser)):
+    """Run the same filter pipeline the orchestrator uses, but return only the
+    funnel counts. Lets the UI tell the user how many candidates a discovery
+    run would actually consider before they hit "Run now"."""
+    from supabase import create_client
+    from utils.config import get_settings
+    from utils.discovery.prefilter import (
+        filter_funders, filter_opportunities, load_org_profile,
+    )
+    _s = get_settings()
+    sb = create_client(_s.supabase_url, _s.supabase_service_key)
+
+    cfg = load_config()
+    ic = cfg.get("import_config") or {}
+    org = load_org_profile()
+    explicit_states = [s.upper() for s in (cfg.get("states") or [])]
+    if explicit_states:
+        org.service_states = explicit_states
+
+    funder = filter_funders(
+        sb, org,
+        min_asset_code=int(ic.get("bmf_min_asset_code") or 7),
+        ntee_prefixes=ic.get("bmf_ntee_prefixes") or [],
+        limit=int(ic.get("bmf_batch_size") or 50),
+        only_unscraped=True,
+    )
+    opp = filter_opportunities(
+        sb, org,
+        close_days=int(ic.get("grants_gov_close_days") or 90),
+        nonprofit_filter=bool(ic.get("grants_gov_nonprofit_filter", True)),
+        limit=int(cfg.get("max_per_source") or 100),
+    )
+
+    def to_funnel(t) -> PreFilterFunnel:
+        return PreFilterFunnel(
+            name=t.name,
+            stages=[PreFilterFunnelStage(label=s["label"], count=s["count"]) for s in t.stages],
+        )
+    return PreFilterPreviewResponse(
+        funders=to_funnel(funder.telemetry),
+        opportunities=to_funnel(opp.telemetry),
+    )
+
+
+# ── Dataset browse views ────────────────────────────────────────────────────
+
+
+_BROWSE_TABLES = {
+    "discovery-funders":   ("discovery_funders",   "ein",            "asset_amount"),
+    "grant-opportunities": ("grant_opportunities", "opportunity_id", "close_date"),
+    "irs-990-index":       ("irs_990_index",       "ein",            "tax_year"),
+    "sam-cfda":            ("sam_cfda_listings",   "program_number", "program_title"),
+}
+
+
+@router.get("/datasets/{name}", response_model=DatasetBrowseResponse)
+def browse_dataset(
+    name: str,
+    limit: int = 25,
+    offset: int = 0,
+    state: str | None = None,
+    user=Depends(dependencies.require_superuser),
+):
+    """Paginated read-only browse for the 4 bulk datasets.
+
+    Supports optional `state` filter on the BMF table. Other filters can be
+    added later; this is the v1 surface for the dataset explorer pages.
+    """
+    if name not in _BROWSE_TABLES:
+        raise HTTPException(status_code=404, detail=f"Unknown dataset {name!r}")
+    table, pk, sort_col = _BROWSE_TABLES[name]
+    limit = max(1, min(int(limit), 100))
+    offset = max(0, int(offset))
+
+    from utils.db.client import get_supabase
+    sb = get_supabase()
+
+    q = sb.table(table).select("*", count="exact")
+    if state and table == "discovery_funders":
+        q = q.eq("state", state.upper())
+    # Descending on numeric/date columns, ascending on text titles
+    if sort_col in ("asset_amount", "close_date", "tax_year"):
+        q = q.order(sort_col, desc=True, nullsfirst=False)
+    else:
+        q = q.order(sort_col)
+    try:
+        res = q.range(offset, offset + limit - 1).execute()
+        rows = res.data or []
+        total = res.count or 0
+    except Exception as exc:
+        logger.warning("dataset browse failed for %s: %s", name, exc)
+        rows, total = [], 0
+
+    return DatasetBrowseResponse(
+        dataset=name,
+        rows=rows,
+        total=total,
+        limit=limit,
+        offset=offset,
     )

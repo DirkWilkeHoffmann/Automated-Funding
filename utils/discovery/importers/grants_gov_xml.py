@@ -15,8 +15,10 @@ Grants.gov XML extract docs:
 
 from __future__ import annotations
 
+import glob
 import io
 import logging
+import os
 import time
 import zipfile
 from datetime import date, datetime, timedelta, timezone
@@ -80,6 +82,34 @@ def _text(el: Optional[ET.Element], tag: str) -> Optional[str]:
     return child.text.strip() if child is not None and child.text else None
 
 
+def _texts_all(el: Optional[ET.Element], tag: str) -> List[str]:
+    """Return all text values for repeating child elements (e.g. EligibleApplicants,
+    CategoryOfFundingActivity which can appear multiple times)."""
+    if el is None:
+        return []
+    children = el.findall(tag)
+    if not children and "}" in el.tag:
+        ns_prefix = el.tag.split("}")[0] + "}"
+        children = el.findall(f"{ns_prefix}{tag}")
+    out: List[str] = []
+    for c in children:
+        if c.text and c.text.strip():
+            out.append(c.text.strip())
+    return out
+
+
+def _parse_bool_yn(val: Optional[str]) -> Optional[bool]:
+    """Grants.gov uses 'Yes' / 'No' strings for boolean-ish fields."""
+    if not val:
+        return None
+    v = val.strip().lower()
+    if v in ("yes", "y", "true", "1"):
+        return True
+    if v in ("no", "n", "false", "0"):
+        return False
+    return None
+
+
 def _parse_opportunity(opp: ET.Element) -> Optional[Dict[str, Any]]:
     """Extract a grant_opportunities record from an <OpportunitySynopsisDetail_1_0> element."""
     opp_id = _text(opp, "OpportunityID")
@@ -100,18 +130,38 @@ def _parse_opportunity(opp: ET.Element) -> Optional[Dict[str, Any]]:
         or _text(opp, "AgencyContactDescription")
     )
 
+    # XML can repeat CategoryOfFundingActivity / EligibleApplicants — join the
+    # category for the legacy single-value column, store the eligible_applicants
+    # list as TEXT[].
+    categories = _texts_all(opp, "CategoryOfFundingActivity")
+    eligible_applicants = _texts_all(opp, "EligibleApplicants")
+
     return {
         "opportunity_id": opp_id,
         "opportunity_number": _text(opp, "OpportunityNumber"),
         "title": _text(opp, "OpportunityTitle"),
         "agency": _text(opp, "AgencyName"),
+        "agency_code": _text(opp, "AgencyCode"),
         "posted_date": posted_date,
         "close_date": close_date,
+        "archive_date": _parse_date(_text(opp, "ArchiveDate")),
+        "last_updated_date": _parse_date(_text(opp, "LastUpdatedDate")),
         "award_ceiling": _parse_int(_text(opp, "AwardCeiling")),
         "award_floor": _parse_int(_text(opp, "AwardFloor")),
-        "category": _text(opp, "CategoryOfFundingActivity"),
+        "estimated_total_program_funding": _parse_int(_text(opp, "EstimatedTotalProgramFunding")),
+        "expected_number_of_awards": _parse_int(_text(opp, "ExpectedNumberOfAwards")),
+        "opportunity_category": _text(opp, "OpportunityCategory"),
+        "funding_instrument_type": _text(opp, "FundingInstrumentType"),
+        "category": " | ".join(categories) if categories else None,
+        "category_explanation": _text(opp, "CategoryExplanation"),
+        "eligible_applicants": eligible_applicants or None,
         "cfda_number": _text(opp, "CFDANumbers"),
         "eligibility_text": _text(opp, "AdditionalInformationOnEligibility"),
+        "cost_sharing_or_matching_required": _parse_bool_yn(_text(opp, "CostSharingOrMatchingRequirement")),
+        "version": _text(opp, "Version"),
+        "grantor_contact_email": _text(opp, "GrantorContactEmail"),
+        "grantor_contact_email_description": _text(opp, "GrantorContactEmailDescription"),
+        "grantor_contact_text": _text(opp, "GrantorContactText"),
         "description": description,
         "url": url,
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -155,11 +205,55 @@ def _download_grants_gov_zip(for_date: Optional[date] = None) -> Optional[bytes]
     return None
 
 
+def _load_tree_from_local(local_path: str) -> Optional[ET.ElementTree]:
+    """Load the Grants.gov XML tree from a local path.
+
+    Accepts either:
+      - a path to an already-extracted XML file (e.g. data/downloads/GrantsDBExtract20260526v2.xml)
+      - a path to a directory containing such an XML file (we pick the most recent)
+      - a path to a .zip file matching the upstream format
+    """
+    if os.path.isdir(local_path):
+        candidates = sorted(glob.glob(os.path.join(local_path, "GrantsDBExtract*.xml")))
+        if not candidates:
+            candidates = sorted(glob.glob(os.path.join(local_path, "GrantsDBExtract*.zip")))
+        if not candidates:
+            logger.error("Grants.gov: no GrantsDBExtract* file found in %s", local_path)
+            return None
+        local_path = candidates[-1]
+    if local_path.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(local_path) as zf:
+                xml_names = [n for n in zf.namelist() if n.endswith(".xml")]
+                if not xml_names:
+                    raise ValueError("no XML in zip")
+                with zf.open(xml_names[0]) as xf:
+                    return ET.parse(xf)
+        except Exception as exc:
+            logger.error("Grants.gov local zip parse failed: %s", exc)
+            return None
+    try:
+        return ET.parse(local_path)
+    except Exception as exc:
+        logger.error("Grants.gov local XML parse failed: %s", exc)
+        return None
+
+
 def run_grants_gov_import(
     for_date: Optional[date] = None,
     progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+    *,
+    local_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Download Grants.gov XML extract and upsert to grant_opportunities.
+
+    Args:
+        for_date:   target a specific date when downloading (default: today, with
+                    fallback to yesterday/day-before).
+        progress_cb: optional callback for status updates.
+        local_path: when set, read a local .xml or .zip (or pick the most recent
+                    from a directory) instead of downloading. Used by the backfill
+                    script.
 
     Returns stats dict: { parsed, upserted, skipped_expired, errors, elapsed_seconds }
     """
@@ -172,30 +266,40 @@ def run_grants_gov_import(
     parsed = upserted = skipped_expired = errors = 0
     today = datetime.now(timezone.utc).date()
 
-    if progress_cb:
+    if local_path:
+        if progress_cb:
+            try:
+                progress_cb({"message": f"loading Grants.gov XML from {local_path}"})
+            except Exception:
+                pass
+        tree = _load_tree_from_local(local_path)
+        if tree is None:
+            return {"parsed": 0, "upserted": 0, "skipped_expired": 0, "errors": 1, "elapsed_seconds": 0}
+    else:
+        if progress_cb:
+            try:
+                progress_cb({"message": "downloading Grants.gov XML extract (up to 3 days back)"})
+            except Exception:
+                pass
+
+        content = _download_grants_gov_zip(for_date)
+        if content is None:
+            logger.error("Grants.gov: could not download extract for any candidate date")
+            return {"parsed": 0, "upserted": 0, "skipped_expired": 0, "errors": 1, "elapsed_seconds": 0}
+
         try:
-            progress_cb({"message": "downloading Grants.gov XML extract (up to 3 days back)"})
-        except Exception:
-            pass
-
-    content = _download_grants_gov_zip(for_date)
-    if content is None:
-        logger.error("Grants.gov: could not download extract for any candidate date")
-        return {"parsed": 0, "upserted": 0, "skipped_expired": 0, "errors": 1, "elapsed_seconds": 0}
-
-    try:
-        with zipfile.ZipFile(io.BytesIO(content)) as zf:
-            xml_names = [n for n in zf.namelist() if n.endswith(".xml")]
-            logger.info("Grants.gov ZIP contents: %s", zf.namelist())
-            if not xml_names:
-                raise ValueError("No XML file found in ZIP")
-            xml_name = xml_names[0]
-            logger.info("Grants.gov: parsing %s", xml_name)
-            with zf.open(xml_name) as xf:
-                tree = ET.parse(xf)
-    except Exception as exc:
-        logger.error("Grants.gov ZIP/XML parse failed: %s", exc)
-        return {"parsed": 0, "upserted": 0, "skipped_expired": 0, "errors": 1, "elapsed_seconds": 0}
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                xml_names = [n for n in zf.namelist() if n.endswith(".xml")]
+                logger.info("Grants.gov ZIP contents: %s", zf.namelist())
+                if not xml_names:
+                    raise ValueError("No XML file found in ZIP")
+                xml_name = xml_names[0]
+                logger.info("Grants.gov: parsing %s", xml_name)
+                with zf.open(xml_name) as xf:
+                    tree = ET.parse(xf)
+        except Exception as exc:
+            logger.error("Grants.gov ZIP/XML parse failed: %s", exc)
+            return {"parsed": 0, "upserted": 0, "skipped_expired": 0, "errors": 1, "elapsed_seconds": 0}
 
     root = tree.getroot()
     logger.info("Grants.gov XML root tag: %s", root.tag)
@@ -261,3 +365,16 @@ def run_grants_gov_import(
         logger.warning("Grants.gov: 0 records parsed/upserted — NOT writing import timestamp")
 
     return stats
+
+
+if __name__ == "__main__":
+    import argparse
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(description="Grants.gov XML importer")
+    parser.add_argument("--local", dest="local_path",
+                        help="Path to local .xml/.zip or a directory containing GrantsDBExtract*.xml")
+    parser.add_argument("--date", dest="for_date",
+                        help="Override target date as YYYY-MM-DD (only when not using --local)")
+    args = parser.parse_args()
+    for_date = date.fromisoformat(args.for_date) if args.for_date else None
+    print(run_grants_gov_import(for_date=for_date, local_path=args.local_path))

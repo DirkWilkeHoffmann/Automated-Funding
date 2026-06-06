@@ -14,11 +14,20 @@ logger = logging.getLogger(__name__)
 _IMPORT_CONFIG_DEFAULTS: Dict[str, Any] = {
     "bmf_min_asset_code": 7,    # 7 = $1M+; range 1–9
     "bmf_ntee_prefixes": [],    # e.g. ["T"] for philanthropy; empty = all
-    "bmf_batch_size": 50,       # foundations to process per discovery run
+    "bmf_batch_size": 500,      # foundations to process per discovery run
     "grants_gov_close_days": 90,  # only import opportunities closing within N days
     "grants_gov_nonprofit_filter": True,  # pre-filter to grants that mention nonprofits in eligibility text
     "bmf_last_imported_at": None,
     "grants_gov_last_imported_at": None,
+    "sam_cfda_last_imported_at": None,
+    "irs_990_index_last_imported_at": None,
+    # Per-dataset refresh cron expressions (UTC). Defaults staggered Sunday
+    # morning to spread load; Grants.gov stays daily because the upstream
+    # XML is published daily.
+    "bmf_cron":           "0 3 * * 0",  # Sun 03:00 UTC
+    "irs_990_index_cron": "0 4 * * 0",  # Sun 04:00 UTC
+    "grants_gov_cron":    "0 5 * * *",  # daily 05:00 UTC
+    "sam_cfda_cron":      "0 6 * * 0",  # Sun 06:00 UTC
 }
 
 _DEFAULTS: Dict[str, Any] = {
@@ -29,16 +38,16 @@ _DEFAULTS: Dict[str, Any] = {
     "sources": {
         "irs_bmf": True,        # IRS BMF private foundations (DB-backed, monthly import)
         "grants_gov_db": True,  # Grants.gov XML extract (DB-backed, daily import)
+        "sam_cfda_db": True,    # SAM CFDA program listings (DB-backed, monthly import)
         "propublica": True,
         "grants_gov": True,
         "sam_gov": False,
-        "web_search": True,
         "federal_register": True,
-        "philanthropy_digest": False,  # defunct — site folded into Candid (no public feed)
         "state_portals": True,
-        # usaspending returns recipient-org pages, not grant opportunities — off by default
-        "usaspending": False,
         "candid": False,  # gated on paid API key in api_tokens
+        # Phase 4 (2026-05-29): web_search, usaspending, philanthropy_digest
+        # were cut from the registry. Old config rows may still include them;
+        # they are silently ignored by _build_enabled_sources().
     },
     "max_per_source": 100,
     "documents_per_run": 200,
@@ -139,6 +148,8 @@ def load_import_config() -> Dict[str, Any]:
 def update_import_timestamps(
     bmf_at: Optional[str] = None,
     grants_gov_at: Optional[str] = None,
+    sam_cfda_at: Optional[str] = None,
+    irs_990_index_at: Optional[str] = None,
 ) -> None:
     """Persist the last-imported timestamps back into discovery_config.import_config."""
     try:
@@ -160,6 +171,10 @@ def update_import_timestamps(
             current["bmf_last_imported_at"] = bmf_at
         if grants_gov_at is not None:
             current["grants_gov_last_imported_at"] = grants_gov_at
+        if sam_cfda_at is not None:
+            current["sam_cfda_last_imported_at"] = sam_cfda_at
+        if irs_990_index_at is not None:
+            current["irs_990_index_last_imported_at"] = irs_990_index_at
         get_supabase().table("discovery_config").update(
             {"import_config": current}
         ).eq("id", row["id"]).execute()
@@ -176,6 +191,8 @@ def save_config(data: Dict[str, Any]) -> Dict[str, Any]:
     # Never overwrite last-imported timestamps via config save (only importers write those)
     import_config.pop("bmf_last_imported_at", None)
     import_config.pop("grants_gov_last_imported_at", None)
+    import_config.pop("sam_cfda_last_imported_at", None)
+    import_config.pop("irs_990_index_last_imported_at", None)
 
     payload = {
         "enabled": bool(data.get("enabled", False)),

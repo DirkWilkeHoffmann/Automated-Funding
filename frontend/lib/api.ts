@@ -53,6 +53,11 @@ export const api = {
       `/results/stale?${params}`
     );
   },
+  previewScrapeUrl: (url: string) =>
+    request<{ type: "listing" | "single"; items: { url: string; title: string }[]; count: number }>(
+      "/scrape/preview",
+      { method: "POST", body: JSON.stringify({ url }) }
+    ),
   scrapeSingle: (fundUrl: string, fundName?: string) =>
     request("/scrape/single", {
       method: "POST",
@@ -90,6 +95,30 @@ export const api = {
   adminOrg: () => request<any>("/admin/org"),
   adminUpdateOrg: (data: Record<string, any>) =>
     request<any>("/admin/org", { method: "PUT", body: JSON.stringify(data) }),
+  adminSuggestCategories: () =>
+    request<{
+      cfda_categories: string[];
+      eligible_applicant_codes: string[];
+      notes: string;
+    }>("/admin/org/suggest-categories", { method: "POST", timeoutMs: 60000 }),
+  adminDefaultPrompts: () =>
+    request<{ system: string; user: string }>("/admin/org/default-prompts"),
+  adminOrgProfileText: () =>
+    request<{ org_profile_text: string }>("/admin/org/profile-text"),
+  adminSuggestProfile: () =>
+    request<{
+      org_type_description: string;
+      service_area_description: string;
+      beneficiaries: string[];
+      programs: string[];
+      income_sources: string[];
+      currency: string;
+      founded_year: number | null;
+      target_outcomes: string[];
+      partner_orgs: string[];
+      accreditations: string[];
+      notes: string;
+    }>("/admin/org/suggest-profile", { method: "POST", timeoutMs: 60000 }),
   adminUsers: () => request<any[]>("/admin/users"),
   adminSetUserRole: (userId: string, role: "user" | "superuser") =>
     request(`/admin/users/${userId}/role`, {
@@ -117,6 +146,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ brave_search_api_key: key }),
     }),
+  adminSetCandidKey: (key: string) =>
+    request("/admin/tokens/candid", {
+      method: "POST",
+      body: JSON.stringify({ candid_api_key: key }),
+    }),
 
   // Stats
   stats: () => request<DashboardStats>("/stats"),
@@ -143,8 +177,26 @@ export const api = {
     request("/discovery/import/bmf", { method: "POST" }),
   triggerGrantsGovImport: () =>
     request("/discovery/import/grants-gov", { method: "POST" }),
+  triggerIRS990IndexImport: () =>
+    request("/discovery/import/irs-990-index", { method: "POST" }),
+  triggerSAMCFDAImport: () =>
+    request("/discovery/import/sam-cfda", { method: "POST" }),
   discoveryImportStatus: () =>
     request<DiscoveryImportStatus>("/discovery/import/status"),
+
+  // Phase 4 additions
+  discoveryHealth: () =>
+    request<DiscoveryHealth>("/discovery/health"),
+  prefilterPreview: () =>
+    request<PreFilterPreview>("/discovery/prefilter-preview"),
+  browseDataset: (name: string, opts: { limit?: number; offset?: number; state?: string } = {}) => {
+    const params = new URLSearchParams();
+    if (opts.limit != null) params.set("limit", String(opts.limit));
+    if (opts.offset != null) params.set("offset", String(opts.offset));
+    if (opts.state) params.set("state", opts.state);
+    const qs = params.toString();
+    return request<DatasetBrowse>(`/discovery/datasets/${name}${qs ? "?" + qs : ""}`);
+  },
 };
 
 // ── Import status shape ──────────────────────────────────────────────────────
@@ -152,10 +204,39 @@ export const api = {
 export type DiscoveryImportStatus = {
   bmf_last_imported_at: string | null;
   grants_gov_last_imported_at: string | null;
+  sam_cfda_last_imported_at: string | null;
+  irs_990_index_last_imported_at: string | null;
   bmf_funders_total: number;
   bmf_funders_unscraped: number;
   grant_opportunities_total: number;
   grant_opportunities_open: number;
+  sam_cfda_total: number;
+  irs_990_index_total: number;
+};
+
+// ── Health / pre-filter / dataset browse shapes (Phase 4) ────────────────────
+
+export type APIKeyStatus = "ok" | "missing" | "invalid" | "unknown";
+
+export type DiscoveryHealth = {
+  keys: { name: string; status: APIKeyStatus; detail?: string | null }[];
+  org_profile_complete: boolean;
+  org_profile_missing: string[];
+};
+
+export type PreFilterFunnelStage = { label: string; count: number };
+export type PreFilterFunnel = { name: string; stages: PreFilterFunnelStage[] };
+export type PreFilterPreview = {
+  funders: PreFilterFunnel;
+  opportunities: PreFilterFunnel;
+};
+
+export type DatasetBrowse = {
+  dataset: string;
+  rows: Record<string, any>[];
+  total: number;
+  limit: number;
+  offset: number;
 };
 
 // ── Dashboard stats shape ─────────────────────────────────────────────────────

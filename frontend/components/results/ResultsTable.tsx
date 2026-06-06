@@ -143,6 +143,80 @@ function groupResults(
   return [{ label: "", rows: results }];
 }
 
+// Phase 10 — per-dimension eligibility rubric rendered as a grid.
+// Reads `match_rubric` JSONB from the fund row. Veto dimensions are flagged
+// with a small badge so the operator can see at a glance which categories
+// can hard-fail the rating.
+const RUBRIC_DIMENSION_ORDER: { key: string; label: string; veto: boolean }[] = [
+  { key: "geography",          label: "Geography",          veto: true },
+  { key: "applicant_type",     label: "Applicant type",     veto: true },
+  { key: "topic_focus",        label: "Topic / focus",      veto: false },
+  { key: "beneficiary",        label: "Beneficiary",        veto: false },
+  { key: "org_history",        label: "Org history / age",  veto: true },
+  { key: "grant_size",         label: "Grant size",         veto: false },
+  { key: "cost_share",         label: "Cost-share",         veto: true },
+  { key: "explicit_exclusion", label: "Explicit exclusion", veto: true },
+];
+
+const RUBRIC_VERDICT_STYLE: Record<string, { icon: string; cls: string; label: string }> = {
+  match:    { icon: "✓", cls: "bg-emerald-50 text-emerald-700 ring-emerald-200", label: "Match" },
+  partial:  { icon: "⚠", cls: "bg-amber-50 text-amber-700 ring-amber-200",     label: "Partial" },
+  mismatch: { icon: "✗", cls: "bg-red-50 text-red-700 ring-red-200",            label: "Mismatch" },
+  unknown:  { icon: "?", cls: "bg-slate-50 text-slate-500 ring-slate-200",       label: "Unknown" },
+};
+
+function MatchRubricCard({ rubric }: { rubric: any }) {
+  if (!rubric || typeof rubric !== "object") {
+    return null;
+  }
+  return (
+    <div className="rounded-xl border border-slate-100 bg-slate-50/60 p-4">
+      <div className="mb-3 flex items-center gap-2">
+        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-indigo-50 text-sm">🎯</div>
+        <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Eligibility Rubric</span>
+        <span className="ml-auto text-[10px] text-slate-400">VETO dimensions in red can hard-fail the rating</span>
+      </div>
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="text-left text-[10px] uppercase tracking-wider text-slate-400">
+            <th className="pb-1 font-semibold">Dimension</th>
+            <th className="pb-1 font-semibold w-24">Verdict</th>
+            <th className="pb-1 font-semibold">Evidence</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-100">
+          {RUBRIC_DIMENSION_ORDER.map(({ key, label, veto }) => {
+            const entry = (rubric[key] || {}) as { verdict?: string; evidence?: string };
+            const verdict = (entry.verdict || "unknown").toLowerCase();
+            const style = RUBRIC_VERDICT_STYLE[verdict] || RUBRIC_VERDICT_STYLE.unknown;
+            return (
+              <tr key={key} className="align-top">
+                <td className="py-1.5 pr-3">
+                  <span className="text-slate-700">{label}</span>
+                  {veto && (
+                    <span className="ml-1.5 rounded bg-red-50 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-red-600">
+                      veto
+                    </span>
+                  )}
+                </td>
+                <td className="py-1.5 pr-3">
+                  <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ${style.cls}`}>
+                    <span>{style.icon}</span>
+                    <span>{style.label}</span>
+                  </span>
+                </td>
+                <td className="py-1.5 text-slate-600">
+                  {entry.evidence || <span className="italic text-slate-300">no evidence captured</span>}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function ResultsTableSkeleton() {
   return (
     <div className="divide-y divide-slate-100">
@@ -578,6 +652,9 @@ const rowUrl = row.fund_url || "";
                               </div>
                             </dl>
                           </div>
+
+                          {/* Eligibility rubric — per-dimension scoring (Phase 10) */}
+                          <MatchRubricCard rubric={row.match_rubric} />
 
                           {/* Evidence card */}
                           <div className="rounded-xl border border-slate-100 bg-slate-50/60 p-4">

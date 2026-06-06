@@ -44,12 +44,10 @@ from utils.discovery.sources.registry import (
     GrantsGovDBSource,
     GrantsGovSource,
     IRS_BMF_Source,
-    PhilanthropyDigestSource,
     ProPublicaSource,
+    SAMCFDASource,
     SamGovSource,
     StatePortalsSource,
-    USAspendingSource,
-    WebSearchSource,
 )
 from utils.models import DiscoveryProgress
 from utils.utils_helpers import normalize_url
@@ -209,27 +207,20 @@ def _build_enabled_sources(config: dict) -> List[Any]:
             enabled.append(SamGovSource(api_key=sam_key))
         else:
             logger.info("SAM.gov enabled but no api_token configured — skipping")
-    if sources_cfg.get("web_search", True):
-        enabled.append(WebSearchSource(brave_api_key=_get_api_key("brave_search"), org_state=org_state))
     if sources_cfg.get("federal_register", True):
         enabled.append(FederalRegisterSource())
     if sources_cfg.get("state_portals", True):
         enabled.append(StatePortalsSource())
-    # usaspending.gov/recipient/* pages show who received money, not open opportunities.
-    # Disabled by default; grants.gov + federal_register cover federal opportunities.
-    if sources_cfg.get("usaspending", False):
-        enabled.append(USAspendingSource())
     # Candid: paid API; only enable if both toggled and a key is present
     candid_key = _get_api_key("candid")
     if sources_cfg.get("candid", False) and candid_key:
         enabled.append(CandidSource(api_key=candid_key, org_state=org_state))
-    if sources_cfg.get("philanthropy_digest", False):
-        # Kept for backwards compat — source is defunct (Candid acquired it)
-        enabled.append(PhilanthropyDigestSource())
     if sources_cfg.get("irs_bmf", True):
         enabled.append(IRS_BMF_Source())
     if sources_cfg.get("grants_gov_db", True):
         enabled.append(GrantsGovDBSource())
+    if sources_cfg.get("sam_cfda_db", True):
+        enabled.append(SAMCFDASource())
 
     return enabled
 

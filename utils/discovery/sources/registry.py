@@ -14,11 +14,91 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from utils.discovery.sources.base import DocumentRef, SourceContext, SourceResult
 
 logger = logging.getLogger(__name__)
+
+
+# ── Foundation pipeline gate (Phase 3 rebuild) ───────────────────────────────
+
+
+def _persist_foundation_gate(
+    sb,
+    ein: str,
+    *,
+    accepts_unsolicited: Optional[bool] = None,
+    grants_page_url: Optional[str] = None,
+    no_grants_page: bool = False,
+    gate_reason: str = "",
+) -> None:
+    """Cache the foundation gate decision on discovery_funders.
+
+    Defensive against missing columns — wrapped in try/except so a fresh
+    schema-not-yet-migrated DB doesn't crash the discovery run.
+    """
+    if not ein:
+        return
+    update: Dict[str, Any] = {
+        "gate_reason": gate_reason or None,
+        "gate_evaluated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if accepts_unsolicited is not None:
+        update["accepts_unsolicited"] = accepts_unsolicited
+    if grants_page_url is not None:
+        update["grants_page_url"] = grants_page_url
+    if no_grants_page:
+        update["no_grants_page"] = True
+    try:
+        sb.table("discovery_funders").update(update).eq("ein", ein).execute()
+    except Exception as exc:
+        # Missing column? Log once and move on — the gate runs in-memory anyway.
+        logger.debug("foundation_gate: persist failed for ein=%s: %s", ein, exc)
+
+
+def _apply_foundation_gate(
+    homepage_url: str,
+    *,
+    narrative_text: Optional[str],
+    org_mission_keywords: List[str],
+    program_areas: Optional[List[str]] = None,
+) -> Tuple[bool, Optional[str], str]:
+    """Run the Phase 3 foundation gates on a single foundation candidate.
+
+    Returns (passed, resolved_grants_page_url, reason_code).
+      - passed = False → caller should DROP this foundation (don't yield)
+      - resolved_grants_page_url is the URL to scrape (None if passed=False)
+      - reason_code is one of:
+          'invitation_only', 'no_program_overlap', 'no_grants_page',
+          'accepted_keyword', 'accepted_llm'
+
+    Gates (cheapest first to minimise LLM cost on drops):
+      1. 990 application_process invitation-only regex → drop
+      2. Program-area overlap with org mission keywords → drop if zero overlap
+         (only enforced when both lists are non-empty)
+      3. foundation_crawler.find_grants_page → drop if None
+    """
+    from utils.discovery.foundation_crawler import find_grants_page, is_invitation_only
+
+    # Gate 1 — Invitation-only (free, regex on text we already have)
+    if narrative_text and is_invitation_only(narrative_text):
+        return False, None, "invitation_only"
+
+    # Gate 2 — Program area overlap with org mission
+    # Only run when we have both signals; absent program_areas means we don't
+    # know the funder's focus and should not pre-drop.
+    if program_areas and org_mission_keywords:
+        prog_text = " ".join(str(p).lower() for p in program_areas)
+        if not any(kw in prog_text for kw in org_mission_keywords):
+            return False, None, "no_program_overlap"
+
+    # Gate 3 — Find an actual grants-application page
+    result = find_grants_page(homepage_url)
+    if not result:
+        return False, None, "no_grants_page"
+    grants_url, source = result
+    return True, grants_url, f"accepted_{source.split('_')[0]}"
 
 
 def _current_filing_year_floor() -> int:
@@ -176,10 +256,18 @@ class ProPublicaSource:
                     f"({len(unique_batches)} batch{'es' if len(unique_batches)!=1 else ''})"
                 ),
             })
+
+            def _zip_progress(msg: str) -> None:
+                # Stream IRS ZIP download status into the source's progress UI.
+                # Lets the operator see "downloading X (Y/ZMB, P%)" instead of
+                # a frozen "fetching IRS XMLs" line for 5-15 minutes.
+                ctx.progress_cb(self.name, {"current_action": msg})
+
             try:
                 xml_by_object_id = fetch_multiple_xmls(
-                    (r["object_id"], r["batch_zip"], int(r["submission_year"]))
-                    for r in ein_to_filing.values()
+                    ((r["object_id"], r["batch_zip"], int(r["submission_year"]))
+                     for r in ein_to_filing.values()),
+                    progress_cb=_zip_progress,
                 )
             except Exception as exc:
                 logger.warning("IRS ZIP fetch failed: %s", exc)
@@ -238,13 +326,36 @@ class ProPublicaSource:
                     if ws:
                         ein_to_website[ein_r] = ws
 
-        # Pass 3: yield SourceResults with the richest available document.
-        # Use the resolved actual website; fall back to ProPublica URL only when
-        # a 990 document is attached (the 990 context makes the scrape worthwhile).
-        # Skip entirely when only a ProPublica profile URL is available with no 990.
+        # Phase 3 (foundation pipeline rebuild) — load org for gates
+        from utils.discovery.prefilter import load_org_profile
+        try:
+            _org_prof = load_org_profile()
+            org_mission_kws = _org_prof.mission_keywords()
+        except Exception:
+            org_mission_kws = []
+        # Local supabase handle for persisting gate decisions
+        try:
+            from supabase import create_client
+            from utils.config import get_settings
+            _s = get_settings()
+            _sb = create_client(_s.supabase_url, _s.supabase_service_key)
+        except Exception:
+            _sb = None
+
+        # Pass 3 — build candidate list, then run the Phase 3 foundation gate
+        # in parallel (Phase 8). Pre-pass 3a does the heavy 990 narrative parse
+        # + DocumentRef construction + homepage resolution serially so the
+        # gate worker only does HTTP/LLM work.
         urls_yielded = 0
         skipped_no_site = 0
+        dropped_invitation = 0
+        dropped_no_grants_page = 0
         resolved_urls: set = set()
+
+        # Phase 3a — build candidate list (cheap, sequential)
+        gate_candidates: List[Dict[str, Any]] = []
+        bypass_candidates: List[Dict[str, Any]] = []  # ProPublica-fallback URLs skip the gate
+        seen_for_dedup: set = set()
         for item in collected:
             if ctx.cancelled():
                 return
@@ -254,9 +365,10 @@ class ProPublicaSource:
             documents: List[DocumentRef] = []
             filing_rec = ein_to_filing.get(ein)
             xml_text = xml_by_object_id.get(filing_rec["object_id"]) if filing_rec else None
+            narrative = ""
 
             if xml_text:
-                narrative = xml_to_narrative(xml_text)
+                narrative = xml_to_narrative(xml_text) or ""
                 if narrative:
                     documents.append(DocumentRef(
                         url=(
@@ -276,38 +388,131 @@ class ProPublicaSource:
                         prefetched_text=narrative,
                     ))
 
-            # Determine the URL to yield
+            # Determine the homepage URL we have on hand
             resolved = ein_to_website.get(ein, "")
-            if resolved and resolved not in resolved_urls:
-                url = resolved
+            if resolved and resolved not in seen_for_dedup:
+                homepage = resolved
+                seen_for_dedup.add(homepage)
             elif not resolved:
                 if not documents:
-                    # No real website AND no 990 context → skip (PropPublica profile is useless)
                     skipped_no_site += 1
                     continue
-                # Have 990 context but no site → use PropPublica URL as anchor; 990 compensates
-                url = item["url"]
+                homepage = item["url"]  # ProPublica profile fallback
             else:
-                # resolved URL already yielded (duplicate across states) → skip
-                continue
+                continue  # duplicate across states
 
+            is_real_site = homepage and not homepage.startswith("https://projects.propublica.org")
+            payload = {
+                "item": item, "org": org, "ein": ein,
+                "documents": documents, "narrative": narrative,
+                "homepage": homepage, "is_real_site": is_real_site,
+            }
+            if is_real_site:
+                gate_candidates.append(payload)
+            else:
+                bypass_candidates.append(payload)
+
+        # Phase 3b — yield bypass candidates immediately (no gate, 990 context compensates)
+        for c in bypass_candidates:
+            if ctx.cancelled():
+                return
+            url = c["homepage"]
             resolved_urls.add(url)
             urls_yielded += 1
             yield SourceResult(
                 url=url,
-                funder_name=org.get("name", ""),
+                funder_name=c["org"].get("name", ""),
                 source_metadata={
                     "source": self.name,
-                    "state": item["state"],
-                    "ein": ein,
+                    "state": c["item"]["state"],
+                    "ein": c["ein"],
+                    "homepage_url": "",
                 },
-                documents=documents,
+                documents=c["documents"],
             )
+
+        # Phase 3c — run gate in parallel (Phase 8 fix)
+        if gate_candidates:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            total = len(gate_candidates)
+            ctx.progress_cb(self.name, {
+                "current_action": f"foundation gate ({total} sites, parallel x5)",
+            })
+            completed_count = 0
+            with ThreadPoolExecutor(max_workers=5, thread_name_prefix="ppub-gate") as pool:
+                fut_to_cand = {
+                    pool.submit(
+                        _apply_foundation_gate,
+                        c["homepage"],
+                        narrative_text=c["narrative"],
+                        org_mission_keywords=org_mission_kws,
+                        program_areas=None,
+                    ): c
+                    for c in gate_candidates
+                }
+                for fut in as_completed(fut_to_cand):
+                    if ctx.cancelled():
+                        break
+                    c = fut_to_cand[fut]
+                    ein = c["ein"]
+                    homepage = c["homepage"]
+                    try:
+                        passed, grants_url, reason = fut.result()
+                    except Exception as exc:
+                        logger.warning("foundation_gate raised for ein=%s: %s", ein, exc)
+                        passed, grants_url, reason = False, None, "gate_error"
+
+                    completed_count += 1
+                    if completed_count % 5 == 0 or completed_count == total:
+                        ctx.progress_cb(self.name, {
+                            "current_action": (
+                                f"gate {completed_count}/{total}: "
+                                f"{urls_yielded - len(bypass_candidates)} accepted, "
+                                f"{dropped_invitation} invitation-only, "
+                                f"{dropped_no_grants_page} no grants page"
+                            ),
+                        })
+
+                    if not passed:
+                        if _sb is not None:
+                            if reason == "invitation_only":
+                                dropped_invitation += 1
+                                _persist_foundation_gate(_sb, ein, accepts_unsolicited=False, gate_reason=reason)
+                            elif reason == "no_grants_page":
+                                dropped_no_grants_page += 1
+                                _persist_foundation_gate(_sb, ein, no_grants_page=True, gate_reason=reason)
+                            else:
+                                _persist_foundation_gate(_sb, ein, gate_reason=reason)
+                        continue
+
+                    url = grants_url or homepage
+                    if _sb is not None:
+                        _persist_foundation_gate(
+                            _sb, ein,
+                            accepts_unsolicited=True,
+                            grants_page_url=grants_url,
+                            gate_reason=reason,
+                        )
+                    resolved_urls.add(url)
+                    urls_yielded += 1
+                    yield SourceResult(
+                        url=url,
+                        funder_name=c["org"].get("name", ""),
+                        source_metadata={
+                            "source": self.name,
+                            "state": c["item"]["state"],
+                            "ein": ein,
+                            "homepage_url": homepage,
+                        },
+                        documents=c["documents"],
+                    )
 
         ctx.progress_cb(self.name, {
             "current_action": (
-                f"done ({urls_yielded} URLs yielded, {skipped_no_site} skipped — no website found, "
-                f"{sum(1 for it in collected if ein_to_filing.get(str(it['org'].get('ein') or '').strip()))} 990 lookups)"
+                f"done ({urls_yielded} yielded, {skipped_no_site} no-site, "
+                f"{dropped_invitation} invitation-only, "
+                f"{dropped_no_grants_page} no grants page)"
             ),
         })
 
@@ -411,6 +616,28 @@ class SamGovSource:
                     return
                 opp = url_to_opp.get(url, {})
                 documents: List[DocumentRef] = []
+
+                # Build prefetched_text from API data so the LLM can evaluate
+                # even if the sam.gov SPA page can't be scraped (JS-rendered).
+                summary_lines = [
+                    f"SAM.gov Grant Opportunity: {opp.get('title', '')}",
+                    f"Federal Agency: {opp.get('agency_name', '')}",
+                    f"Posted: {opp.get('posted_date', '')}",
+                    f"Closes: {opp.get('close_date', '')}",
+                    f"Opportunity URL: {url}",
+                ]
+                if opp.get("description"):
+                    summary_lines.append(f"Description: {opp['description']}")
+                if opp.get("set_aside_type"):
+                    summary_lines.append(f"Set-Aside Type: {opp['set_aside_type']}")
+                documents.append(DocumentRef(
+                    url=f"sam_gov_api://{opp.get('notice_id', '')}",
+                    kind="rfp",
+                    source_url=url,
+                    extra={"source": self.name, "notice_id": opp.get("notice_id", "")},
+                    prefetched_text="\n".join(summary_lines),
+                ))
+
                 for link in opp.get("resource_links") or []:
                     if isinstance(link, str) and link.startswith("http"):
                         documents.append(DocumentRef(
@@ -434,47 +661,10 @@ class SamGovSource:
         return self._new_state
 
 
-# ── Web search ────────────────────────────────────────────────────────────────
-
-
-class WebSearchSource:
-    name = "web_search"
-
-    def __init__(self, brave_api_key: Optional[str], org_state: Optional[str]) -> None:
-        self._brave_api_key = brave_api_key
-        self._org_state = org_state
-        self._new_state: Dict[str, Any] = {}
-
-    def fetch(self, ctx: SourceContext) -> Iterator[SourceResult]:
-        from utils.discovery.sources.web_search import search_web_for_grants
-
-        query_idx = int(ctx.state.get("query_idx", 0))
-        next_idx = (query_idx + 1) % 5
-        today = datetime.now(timezone.utc).date().isoformat()
-
-        ctx.progress_cb(self.name, {"current_action": f"querying (query #{query_idx})"})
-        try:
-            urls, next_idx = search_web_for_grants(
-                keywords=ctx.keywords,
-                brave_api_key=self._brave_api_key,
-                query_idx=query_idx,
-                org_state=self._org_state,
-            )
-            for url in urls:
-                if ctx.cancelled():
-                    return
-                yield SourceResult(
-                    url=url,
-                    source_metadata={"source": self.name, "query_idx": query_idx},
-                )
-        except Exception as exc:
-            logger.warning("Web search failed: %s", exc)
-            ctx.progress_cb(self.name, {"current_action": f"failed: {exc}"})
-
-        self._new_state = {"query_idx": next_idx, "last_run_date": today}
-
-    def close_state(self) -> Dict[str, Any]:
-        return self._new_state
+# Cut 2026-05-29 (Phase 4): WebSearchSource removed — web search returned
+# generic listicles / dead links / aggregator pages with poor signal-to-noise.
+# Replaced with structured directories (Grants.gov DB, IRS BMF, federal
+# register, state portals).
 
 
 # ── Federal Register ──────────────────────────────────────────────────────────
@@ -623,106 +813,10 @@ class StatePortalsSource:
         return self._new_state
 
 
-# ── USAspending.gov (Phase 3 — replaces defunct PND) ────────────────────────
-
-
-class USAspendingSource:
-    """USAspending.gov — federal awards spending API.
-
-    Pulls recent grant-type awards to surface federal funders that are actively
-    distributing money. Returns the recipient.recipient_url when present (the
-    org's own website) or falls back to a USAspending recipient page URL.
-
-    API docs: https://api.usaspending.gov/docs/endpoints
-    """
-
-    name = "usaspending"
-
-    def __init__(self) -> None:
-        self._new_state: Dict[str, Any] = {}
-
-    def fetch(self, ctx: SourceContext) -> Iterator[SourceResult]:
-        import requests
-
-        today = datetime.now(timezone.utc).date()
-        since_date = _lookback_since(ctx.state.get("last_run_date"), default_days=30)
-
-        ctx.progress_cb(self.name, {"current_action": f"querying (since {since_date})"})
-
-        # USAspending's `keywords` filter is OR-of-tokens treated as a phrase
-        # by their backend — long auto-derived strings return 0 matches.
-        # Use the keyword only if the operator gave us a short, focused term.
-        kw = (ctx.keywords or "").strip()
-        api_kws = [kw] if (kw and len(kw.split()) <= 2) else None
-
-        body = {
-            "filters": {
-                "award_type_codes": ["02", "03", "04", "05"],  # grants & cooperative agreements
-                "time_period": [{"start_date": since_date, "end_date": today.isoformat()}],
-                "keywords": api_kws,
-            },
-            "fields": [
-                "Award ID", "Recipient Name", "Awarding Agency",
-                "Award Amount", "recipient_id", "generated_internal_id",
-            ],
-            "page": 1,
-            "limit": min(ctx.max_per_source, 100),
-            "sort": "Award Amount",
-            "order": "desc",
-        }
-        # Drop None keys (API rejects null keywords)
-        if body["filters"]["keywords"] is None:
-            del body["filters"]["keywords"]
-
-        try:
-            resp = requests.post(
-                "https://api.usaspending.gov/api/v2/search/spending_by_award/",
-                json=body,
-                headers={"User-Agent": "automated-funding-bot/1.0", "Accept": "application/json"},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:
-            logger.warning("USAspending API error: %s", exc)
-            ctx.progress_cb(self.name, {"current_action": f"failed: {exc}"})
-            self._new_state = {"last_run_date": today.isoformat()}
-            return
-
-        results = data.get("results") or []
-        seen_recipients: set = set()
-        for r in results:
-            if ctx.cancelled():
-                return
-            recipient = (r.get("Recipient Name") or "").strip()
-            if not recipient:
-                continue
-            key = recipient.lower()
-            if key in seen_recipients:
-                continue
-            seen_recipients.add(key)
-
-            # USAspending exposes a per-recipient detail page via generated_internal_id
-            rec_id = r.get("generated_internal_id") or r.get("recipient_id")
-            url = (
-                f"https://www.usaspending.gov/recipient/{rec_id}/latest"
-                if rec_id
-                else f"https://www.usaspending.gov/search?keywords={recipient.replace(' ', '+')}"
-            )
-            yield SourceResult(
-                url=url,
-                funder_name=r.get("Awarding Agency") or "",
-                source_metadata={
-                    "source": self.name,
-                    "recipient": recipient,
-                    "award_amount": r.get("Award Amount"),
-                },
-            )
-
-        self._new_state = {"last_run_date": today.isoformat()}
-
-    def close_state(self) -> Dict[str, Any]:
-        return self._new_state
+# Cut 2026-05-29 (Phase 4): USAspendingSource removed — usaspending.gov/recipient/*
+# pages show who RECEIVED federal money, not how to apply for it. Wrong target
+# for grant discovery. Grants.gov + Federal Register cover the open-opportunity
+# side of federal funding.
 
 
 # ── Candid (paid API, gated on key) ──────────────────────────────────────────
@@ -780,36 +874,8 @@ class CandidSource:
         return self._new_state
 
 
-# ── Philanthropy News Digest (defunct as of 2026 — kept for compat) ──────────
-
-
-class PhilanthropyDigestSource:
-    name = "philanthropy_digest"
-
-    def __init__(self) -> None:
-        self._new_state: Dict[str, Any] = {}
-
-    def fetch(self, ctx: SourceContext) -> Iterator[SourceResult]:
-        from utils.discovery.sources.philanthropy_digest import fetch_pnd_grant_urls
-
-        since_date = ctx.state.get("last_posted_from")
-        today = datetime.now(timezone.utc).date().isoformat()
-
-        ctx.progress_cb(self.name, {"current_action": f"fetching RSS (since {since_date or 'all'})"})
-        try:
-            urls = fetch_pnd_grant_urls(since_date=since_date)
-            for url in urls[: ctx.max_per_source]:
-                if ctx.cancelled():
-                    return
-                yield SourceResult(url=url, source_metadata={"source": self.name})
-        except Exception as exc:
-            logger.warning("PND RSS fetch failed: %s", exc)
-            ctx.progress_cb(self.name, {"current_action": f"failed: {exc}"})
-
-        self._new_state = {"last_posted_from": today}
-
-    def close_state(self) -> Dict[str, Any]:
-        return self._new_state
+# Cut 2026-05-29 (Phase 4): PhilanthropyDigestSource removed — PND was
+# acquired by Candid in 2026 and its public RSS feeds are no longer maintained.
 
 
 # ── IRS BMF (private foundations database) ───────────────────────────────────
@@ -827,6 +893,11 @@ class IRS_BMF_Source:
         from supabase import create_client
         from utils.config import get_settings
         from utils.discovery.config_store import load_config
+        from utils.discovery.prefilter import (
+            emit_telemetry,
+            filter_funders,
+            load_org_profile,
+        )
         from utils.US_Grant_Discovery.prospector import resolve_org_website
         from utils.discovery.sources.irs_990_zips import fetch_multiple_xmls
         from utils.discovery.sources.irs_990_parser import extract_website_from_xml
@@ -839,33 +910,28 @@ class IRS_BMF_Source:
         min_asset_code = int(import_cfg.get("bmf_min_asset_code") or 7)
         batch_size = int(import_cfg.get("bmf_batch_size") or 50)
         ntee_prefixes: List[str] = import_cfg.get("bmf_ntee_prefixes") or []
-        states: List[str] = [s.upper() for s in (ctx.states or [])]
+        explicit_states: List[str] = [s.upper() for s in (ctx.states or [])]
 
-        ctx.progress_cb(self.name, {"current_action": "querying discovery_funders"})
-        try:
-            query = (
-                sb.table("discovery_funders")
-                .select("ein, name, city, state, website")
-                .is_("scraped_at", "null")
-                .gte("asset_code", min_asset_code)
-            )
-            if states:
-                query = query.in_("state", states)
-            rows = query.order("asset_code", desc=True).limit(batch_size * 3).execute().data or []
-        except Exception as exc:
-            logger.warning("IRS_BMF_Source: DB query failed: %s", exc)
-            ctx.progress_cb(self.name, {"current_action": f"DB query failed: {exc}"})
-            return
+        org = load_org_profile()
+        # If discovery_config.states is set, it overrides the org's service_states
+        # (operator's explicit per-run intent wins).
+        if explicit_states:
+            org.service_states = explicit_states
 
-        if ntee_prefixes:
-            rows = [
-                r for r in rows
-                if any((r.get("ntee_code") or "").startswith(p) for p in ntee_prefixes)
-            ]
+        ctx.progress_cb(self.name, {"current_action": "applying org-profile pre-filter"})
+        result = filter_funders(
+            sb,
+            org,
+            min_asset_code=min_asset_code,
+            ntee_prefixes=ntee_prefixes,
+            limit=batch_size,
+            only_unscraped=True,
+        )
+        emit_telemetry(ctx.progress_cb, self.name, result.telemetry)
+        batch = result.rows
 
-        batch = rows[:batch_size]
         if not batch:
-            ctx.progress_cb(self.name, {"current_action": "no unscraped foundations found"})
+            ctx.progress_cb(self.name, {"current_action": "pre-filter produced no candidates"})
             return
 
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -879,29 +945,28 @@ class IRS_BMF_Source:
                 ein_to_website[row["ein"]] = ws
 
         # Phase 1: IRS 990 index lookup (uses local sb — no singleton race)
+        ein_to_filing: Dict[str, Dict[str, Any]] = {}
+        xml_by_object_id: Dict[str, str] = {}
         needs_990 = [r for r in batch if r["ein"] not in ein_to_website]
         if needs_990:
             ctx.progress_cb(self.name, {"current_action": f"looking up {len(needs_990)} EINs in IRS 990 index"})
             year_floor = datetime.now(timezone.utc).year - 3
-            ein_to_filing: Dict[str, Dict[str, Any]] = {}
             try:
-                for row in needs_990:
-                    if ctx.cancelled():
-                        break
-                    ein = row["ein"]
-                    filing_rows = (
-                        sb.table("irs_990_index")
-                        .select("object_id, batch_zip, submission_year, tax_year, return_type")
-                        .eq("ein", ein)
-                        .order("tax_year", desc=True)
-                        .limit(1)
-                        .execute()
-                        .data or []
-                    )
-                    if filing_rows:
-                        rec = filing_rows[0]
-                        if int(rec.get("tax_year") or 0) >= year_floor:
-                            ein_to_filing[ein] = rec
+                ein_list = [r["ein"] for r in needs_990]
+                # Single bulk query instead of N individual round-trips
+                all_filings = (
+                    sb.table("irs_990_index")
+                    .select("ein, object_id, batch_zip, submission_year, tax_year, return_type")
+                    .in_("ein", ein_list)
+                    .order("tax_year", desc=True)
+                    .execute()
+                    .data or []
+                )
+                # Keep only the most recent filing per EIN (already ordered desc)
+                for rec in all_filings:
+                    ein = rec["ein"]
+                    if ein not in ein_to_filing and int(rec.get("tax_year") or 0) >= year_floor:
+                        ein_to_filing[ein] = rec
             except Exception as exc:
                 logger.warning("IRS_BMF_Source: 990 index lookup failed: %s", exc)
 
@@ -916,14 +981,18 @@ class IRS_BMF_Source:
                         f"({len(unique_batches)} batch{'es' if len(unique_batches) != 1 else ''})"
                     ),
                 })
+
+                def _zip_progress(msg: str) -> None:
+                    ctx.progress_cb(self.name, {"current_action": msg})
+
                 try:
                     xml_by_object_id = fetch_multiple_xmls(
-                        (r["object_id"], r["batch_zip"], int(r["submission_year"]))
-                        for r in ein_to_filing.values()
+                        ((r["object_id"], r["batch_zip"], int(r["submission_year"]))
+                         for r in ein_to_filing.values()),
+                        progress_cb=_zip_progress,
                     )
                 except Exception as exc:
                     logger.warning("IRS_BMF_Source: 990 ZIP fetch failed: %s", exc)
-                    xml_by_object_id = {}
 
                 for ein, rec in ein_to_filing.items():
                     xml = xml_by_object_id.get(rec.get("object_id", ""))
@@ -970,24 +1039,225 @@ class IRS_BMF_Source:
         except Exception as exc:
             logger.warning("IRS_BMF_Source: could not update scraped_at: %s", exc)
 
-        resolved_count = len(ein_to_website)
-        ctx.progress_cb(self.name, {"current_action": f"yielding {resolved_count} URLs"})
+        # Phase 3 — extract 990 narrative text for invitation-only gate.
+        # Reuses the XMLs already fetched above (no extra HTTP).
+        from utils.discovery.sources.irs_990_parser import xml_to_narrative
+        ein_to_narrative: Dict[str, str] = {}
+        for ein, rec in ein_to_filing.items():
+            xml = xml_by_object_id.get(rec.get("object_id", ""))
+            if xml:
+                try:
+                    txt = xml_to_narrative(xml) or ""
+                    if txt:
+                        ein_to_narrative[ein] = txt
+                except Exception:
+                    pass
+
+        # Phase 3 — derived org-mission keywords for program-area overlap gate
+        org_kws = org.mission_keywords()
+
+        # Build the candidate list ONCE so we can parallelise the gate.
+        # Rows with no resolved homepage are pre-filtered (nothing to crawl).
+        candidates: List[Dict[str, Any]] = []
         for row in batch:
+            ein = row["ein"]
+            homepage = ein_to_website.get(ein)
+            if not homepage:
+                continue
+            candidates.append({
+                "row": row,
+                "ein": ein,
+                "homepage": homepage,
+                "narrative": ein_to_narrative.get(ein),
+            })
+
+        resolved_count = len(candidates)
+        ctx.progress_cb(self.name, {
+            "current_action": f"applying foundation gates to {resolved_count} candidates (parallel)",
+        })
+
+        # Phase 8 — parallelise the foundation gate.
+        # Each candidate does 1 HTTP fetch (homepage) + maybe 1 LLM call. Five
+        # concurrent workers caps download bandwidth and OpenAI RPS while
+        # cutting wall-clock from ~5 min to ~1 min on a 50-candidate batch.
+        yielded = 0
+        dropped_invitation = 0
+        dropped_no_grants_page = 0
+        completed_count = 0
+        if candidates:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            with ThreadPoolExecutor(max_workers=5, thread_name_prefix="bmf-gate") as pool:
+                fut_to_cand = {
+                    pool.submit(
+                        _apply_foundation_gate,
+                        c["homepage"],
+                        narrative_text=c["narrative"],
+                        org_mission_keywords=org_kws,
+                        program_areas=None,
+                    ): c
+                    for c in candidates
+                }
+                for fut in as_completed(fut_to_cand):
+                    if ctx.cancelled():
+                        break
+                    c = fut_to_cand[fut]
+                    ein = c["ein"]
+                    homepage = c["homepage"]
+                    row = c["row"]
+                    try:
+                        passed, grants_url, reason = fut.result()
+                    except Exception as exc:
+                        logger.warning("foundation_gate raised for ein=%s: %s", ein, exc)
+                        passed, grants_url, reason = False, None, "gate_error"
+
+                    completed_count += 1
+                    # Live progress so the UI shows the gate making progress
+                    if completed_count % 5 == 0 or completed_count == resolved_count:
+                        ctx.progress_cb(self.name, {
+                            "current_action": (
+                                f"gate {completed_count}/{resolved_count}: "
+                                f"{yielded} accepted, {dropped_invitation} invitation-only, "
+                                f"{dropped_no_grants_page} no grants page"
+                            ),
+                        })
+
+                    if not passed:
+                        if reason == "invitation_only":
+                            dropped_invitation += 1
+                            _persist_foundation_gate(
+                                sb, ein, accepts_unsolicited=False, gate_reason=reason
+                            )
+                        elif reason == "no_grants_page":
+                            dropped_no_grants_page += 1
+                            _persist_foundation_gate(
+                                sb, ein, no_grants_page=True, gate_reason=reason
+                            )
+                        else:
+                            _persist_foundation_gate(sb, ein, gate_reason=reason)
+                        continue
+
+                    _persist_foundation_gate(
+                        sb, ein,
+                        accepts_unsolicited=True,
+                        grants_page_url=grants_url,
+                        gate_reason=reason,
+                    )
+                    yielded += 1
+                    yield SourceResult(
+                        url=grants_url or homepage,
+                        funder_name=row.get("name"),
+                        source_metadata={
+                            "source": self.name,
+                            "ein": ein,
+                            "city": row.get("city"),
+                            "state": row.get("state"),
+                            "homepage_url": homepage,
+                            "gate_reason": reason,
+                        },
+                    )
+
+        ctx.progress_cb(self.name, {
+            "current_action": (
+                f"gate: {yielded} accepted, {dropped_invitation} invitation-only, "
+                f"{dropped_no_grants_page} no grants page"
+            ),
+        })
+
+    def close_state(self) -> Dict[str, Any]:
+        return self._new_state
+
+
+# ── SAM CFDA DB (program listings from monthly import) ───────────────────────
+
+
+class SAMCFDASource:
+    """Yields federal program website URLs from the sam_cfda_listings table.
+
+    Each CFDA program row has a website_address pointing to the federal agency's
+    description page for that grant program — a richer target than the SAM.gov
+    opportunity listing. The program objectives and eligibility text are injected
+    as prefetched_text so the LLM can evaluate without scraping JS-heavy pages.
+    """
+
+    name = "sam_cfda_db"
+
+    def __init__(self) -> None:
+        self._new_state: Dict[str, Any] = {}
+
+    def fetch(self, ctx: SourceContext) -> Iterator[SourceResult]:
+        from supabase import create_client
+        from utils.config import get_settings
+        from utils.db.funds_store import get_processed_urls
+
+        _s = get_settings()
+        sb = create_client(_s.supabase_url, _s.supabase_service_key)
+
+        ctx.progress_cb(self.name, {"current_action": "querying sam_cfda_listings"})
+        try:
+            rows = (
+                sb.table("sam_cfda_listings")
+                .select(
+                    "program_number, program_title, federal_agency, objectives, "
+                    "applicant_eligibility, website_address"
+                )
+                .not_.is_("website_address", "null")
+                .limit(ctx.max_per_source * 3)
+                .execute()
+                .data or []
+            )
+        except Exception as exc:
+            logger.warning("SAMCFDASource: query failed: %s", exc)
+            ctx.progress_cb(self.name, {"current_action": f"failed: {exc}"})
+            return
+
+        try:
+            processed = get_processed_urls()
+        except Exception:
+            processed = set()
+
+        count = 0
+        for row in rows:
             if ctx.cancelled():
                 return
-            website = ein_to_website.get(row["ein"])
-            if not website:
+            url = (row.get("website_address") or "").strip()
+            if not url or not url.startswith("http"):
                 continue
+            if url in processed:
+                continue
+
+            lines = [
+                f"CFDA Program: {row.get('program_title', '')} ({row.get('program_number', '')})",
+                f"Federal Agency: {row.get('federal_agency', '')}",
+            ]
+            if row.get("objectives"):
+                lines.append(f"Objectives: {row['objectives']}")
+            if row.get("applicant_eligibility"):
+                lines.append(f"Applicant Eligibility: {row['applicant_eligibility']}")
+
             yield SourceResult(
-                url=website,
-                funder_name=row.get("name"),
+                url=url,
+                funder_name=row.get("federal_agency") or row.get("program_title", ""),
                 source_metadata={
                     "source": self.name,
-                    "ein": row.get("ein"),
-                    "city": row.get("city"),
-                    "state": row.get("state"),
+                    "program_number": row.get("program_number", ""),
+                    "program_title": row.get("program_title", ""),
                 },
+                documents=[
+                    DocumentRef(
+                        url=f"sam_cfda://{row.get('program_number', '')}",
+                        kind="rfp",
+                        source_url=url,
+                        extra={"source": self.name, "cfda_number": row.get("program_number", "")},
+                        prefetched_text="\n".join(lines),
+                    )
+                ],
             )
+            count += 1
+            if count >= ctx.max_per_source:
+                break
+
+        ctx.progress_cb(self.name, {"urls_found": count})
 
     def close_state(self) -> Dict[str, Any]:
         return self._new_state
@@ -1007,6 +1277,11 @@ class GrantsGovDBSource:
         from utils.config import get_settings
         from utils.db.funds_store import get_processed_urls
         from utils.discovery.config_store import load_config
+        from utils.discovery.prefilter import (
+            emit_telemetry,
+            filter_opportunities,
+            load_org_profile,
+        )
 
         _s = get_settings()
         sb = create_client(_s.supabase_url, _s.supabase_service_key)
@@ -1014,48 +1289,53 @@ class GrantsGovDBSource:
         config = load_config()
         import_cfg = config.get("import_config") or {}
         close_days = int(import_cfg.get("grants_gov_close_days") or 90)
-
-        today = datetime.now(timezone.utc).date()
-        close_floor = today.isoformat()
-        close_ceil = (today + timedelta(days=close_days)).isoformat()
-
         nonprofit_filter = bool(import_cfg.get("grants_gov_nonprofit_filter", True))
-        _NONPROFIT_KEYWORDS = [
-            "nonprofit", "non-profit", "501(c)(3)", "501(c)3",
-            "community organization", "community-based organization",
-            "charitable organization",
-        ]
 
-        ctx.progress_cb(self.name, {"current_action": "querying grant_opportunities"})
-        try:
-            rows = (
-                sb.table("grant_opportunities")
-                .select("opportunity_id, title, agency, url, close_date, eligibility_text")
-                .gte("close_date", close_floor)
-                .lte("close_date", close_ceil)
-                .order("close_date")
-                .limit(ctx.max_per_source * 4)
-                .execute()
-                .data
-                or []
-            )
-        except Exception as exc:
-            logger.warning("GrantsGovDBSource: DB query failed: %s", exc)
-            ctx.progress_cb(self.name, {"current_action": f"DB query failed: {exc}"})
-            return
+        org = load_org_profile()
 
-        if nonprofit_filter:
-            def _is_nonprofit_eligible(row: Dict[str, Any]) -> bool:
-                et = (row.get("eligibility_text") or "").lower()
-                if not et:
-                    return True  # No eligibility text — include; scraper will decide
-                return any(kw in et for kw in _NONPROFIT_KEYWORDS)
-            rows = [r for r in rows if _is_nonprofit_eligible(r)]
+        ctx.progress_cb(self.name, {"current_action": "applying org-profile pre-filter"})
+        result = filter_opportunities(
+            sb,
+            org,
+            close_days=close_days,
+            nonprofit_filter=nonprofit_filter,
+            limit=ctx.max_per_source,
+        )
+        emit_telemetry(ctx.progress_cb, self.name, result.telemetry)
+        rows = result.rows
 
         try:
             processed = get_processed_urls()
         except Exception:
             processed = set()
+
+        # Pre-fetch CFDA enrichment in bulk: collect distinct cfda_numbers and
+        # one round-trip to sam_cfda_listings. Costs nothing when the table is
+        # empty (Phase 1 deferred), so this is safe today.
+        cfda_numbers = sorted({r.get("cfda_number") for r in rows if r.get("cfda_number")})
+        cfda_lookup: Dict[str, Dict[str, Any]] = {}
+        if cfda_numbers:
+            try:
+                cfda_rows = (
+                    sb.table("sam_cfda_listings")
+                    .select(
+                        "program_number, program_title, federal_agency, objectives, "
+                        "applicant_eligibility, range_and_average_assistance, "
+                        "examples_of_funded_projects, website_address"
+                    )
+                    .in_("program_number", cfda_numbers)
+                    .execute()
+                    .data
+                    or []
+                )
+                cfda_lookup = {row["program_number"]: row for row in cfda_rows}
+                if cfda_lookup:
+                    ctx.progress_cb(self.name, {
+                        "current_action": f"CFDA enrichment: matched {len(cfda_lookup)} programs",
+                    })
+            except Exception as exc:
+                # Table absent or query failed — discovery continues without enrichment.
+                logger.debug("GrantsGovDBSource: CFDA lookup skipped: %s", exc)
 
         count = 0
         for row in rows:
@@ -1064,6 +1344,37 @@ class GrantsGovDBSource:
             url = row.get("url")
             if not url or url in processed:
                 continue
+
+            documents: List[DocumentRef] = []
+            cfda_no = row.get("cfda_number")
+            program = cfda_lookup.get(cfda_no) if cfda_no else None
+            if program:
+                # Inject CFDA program context as a "document" with prefetched_text;
+                # the document fetcher will run the LLM doc-extractor on this and
+                # the scrape_worker will append the summary to the page context.
+                lines = [
+                    f"=== CFDA Program Context: {program.get('program_title','')} ({cfda_no}) ===",
+                ]
+                if program.get("federal_agency"):
+                    lines.append(f"Federal Agency: {program['federal_agency']}")
+                if program.get("objectives"):
+                    lines.append(f"Objectives: {program['objectives']}")
+                if program.get("applicant_eligibility"):
+                    lines.append(f"Applicant Eligibility: {program['applicant_eligibility']}")
+                if program.get("range_and_average_assistance"):
+                    lines.append(f"Range and Average of Financial Assistance: {program['range_and_average_assistance']}")
+                if program.get("examples_of_funded_projects"):
+                    lines.append(f"Examples of Funded Projects: {program['examples_of_funded_projects']}")
+                if program.get("website_address"):
+                    lines.append(f"Program website: {program['website_address']}")
+                documents.append(DocumentRef(
+                    url=f"sam_cfda://{cfda_no}",
+                    kind="rfp",
+                    source_url=url,
+                    extra={"source": self.name, "cfda_number": cfda_no},
+                    prefetched_text="\n".join(lines),
+                ))
+
             yield SourceResult(
                 url=url,
                 funder_name=row.get("title") or row.get("agency"),
@@ -1072,8 +1383,14 @@ class GrantsGovDBSource:
                     "opportunity_id": row.get("opportunity_id"),
                     "title": row.get("title"),
                     "agency": row.get("agency"),
+                    "agency_code": row.get("agency_code"),
                     "close_date": row.get("close_date"),
+                    "award_ceiling": row.get("award_ceiling"),
+                    "cfda_number": cfda_no,
+                    "funding_instrument_type": row.get("funding_instrument_type"),
+                    "cost_sharing_required": row.get("cost_sharing_or_matching_required"),
                 },
+                documents=documents,
             )
             count += 1
             if count >= ctx.max_per_source:

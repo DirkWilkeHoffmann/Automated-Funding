@@ -18,6 +18,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -71,14 +72,33 @@ def _mark_refreshed(submission_year: int, row_count: int) -> None:
         logger.warning("Could not mark irs_990_index_refresh: %s", exc)
 
 
-def _stream_index(submission_year: int) -> Iterable[Dict[str, Any]]:
+def _stream_index(
+    submission_year: int,
+    *,
+    local_dir: Optional[str] = None,
+) -> Iterable[Dict[str, Any]]:
     """Stream rows from the IRS year index CSV.
 
     The file is ~90MB; we stream-parse to avoid loading it all into memory.
-    Each row corresponds to one filing. The server may transparently gzip the
-    response — `iter_lines(decode_unicode=True)` handles decompression
-    correctly, unlike reading `resp.raw` directly.
+
+    When `local_dir` is set, reads `index_{year}.csv` (or `irs_990_index_{year}.csv`
+    as named by our analysis script) from that directory instead of downloading.
     """
+    if local_dir:
+        for candidate in (
+            os.path.join(local_dir, f"index_{submission_year}.csv"),
+            os.path.join(local_dir, f"irs_990_index_{submission_year}.csv"),
+        ):
+            if os.path.isfile(candidate):
+                logger.info("Reading IRS index from local file %s", candidate)
+                with open(candidate, encoding="utf-8", errors="replace") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        yield row
+                return
+        logger.warning("IRS index local file not found for year %s in %s", submission_year, local_dir)
+        return
+
     url = _INDEX_URL.format(year=submission_year)
     logger.info("Fetching IRS index for submission_year=%s", submission_year)
     with requests.get(url, headers=_HEADERS, stream=True, timeout=180) as resp:
@@ -89,14 +109,24 @@ def _stream_index(submission_year: int) -> Iterable[Dict[str, Any]]:
             yield row
 
 
-def refresh_index_for_year(submission_year: int, *, force: bool = False) -> int:
+def refresh_index_for_year(
+    submission_year: int,
+    *,
+    force: bool = False,
+    local_dir: Optional[str] = None,
+) -> int:
     """Download + persist the IRS index for `submission_year`. Returns row count.
 
     Skips download if a refresh has happened within REFRESH_TTL_DAYS unless
     force=True. Upserts in chunks to avoid huge single POSTs to Supabase.
+
+    Args:
+        submission_year: e.g. 2024
+        force:           skip TTL check
+        local_dir:       if set, read from local index_{year}.csv instead of downloading
     """
     age = _refresh_age_days(submission_year)
-    if not force and age is not None and age < _REFRESH_TTL_DAYS:
+    if not force and not local_dir and age is not None and age < _REFRESH_TTL_DAYS:
         logger.info(
             "IRS index for %s already fresh (refreshed %.1f days ago)",
             submission_year, age,
@@ -107,7 +137,7 @@ def refresh_index_for_year(submission_year: int, *, force: bool = False) -> int:
     total = 0
     seen_ein_year: set = set()
 
-    for row in _stream_index(submission_year):
+    for row in _stream_index(submission_year, local_dir=local_dir):
         ein = (row.get("EIN") or "").strip()
         if not ein:
             continue
@@ -137,28 +167,36 @@ def refresh_index_for_year(submission_year: int, *, force: bool = False) -> int:
         })
 
         if len(pending) >= _UPSERT_CHUNK:
-            _bulk_upsert(pending)
-            total += len(pending)
+            total += _bulk_upsert(pending)
             pending = []
-            if total % 10000 == 0:
+            if total and total % 10000 == 0:
                 logger.info("  IRS index %s: %d rows ingested", submission_year, total)
 
     if pending:
-        _bulk_upsert(pending)
-        total += len(pending)
+        total += _bulk_upsert(pending)
 
     _mark_refreshed(submission_year, total)
+    # Also stamp the discovery_config.import_config so the admin UI can show
+    # a single "Last refreshed" per dataset alongside BMF / Grants.gov / SAM.
+    try:
+        from utils.discovery.config_store import update_import_timestamps
+        update_import_timestamps(irs_990_index_at=datetime.now(timezone.utc).isoformat())
+    except Exception as exc:
+        logger.warning("Could not update 990 index import timestamp: %s", exc)
     logger.info("IRS index %s refresh complete: %d rows", submission_year, total)
     return total
 
 
-def _bulk_upsert(rows: List[Dict[str, Any]]) -> None:
+def _bulk_upsert(rows: List[Dict[str, Any]]) -> int:
+    """Upsert a batch. Returns rows actually persisted (0 on failure)."""
     try:
         get_supabase().table("irs_990_index").upsert(
             rows, on_conflict="ein,tax_year"
         ).execute()
+        return len(rows)
     except Exception as exc:
         logger.warning("irs_990_index upsert failed (%d rows): %s", len(rows), exc)
+        return 0
 
 
 def lookup_filing(ein: str, *, max_age_years: int = 3) -> Optional[Dict[str, Any]]:
@@ -240,3 +278,23 @@ def ensure_recent_indexes(years_back: int = 2, *, blocking: bool = False) -> Non
         _bg_refresh_threads[year] = t
         t.start()
         logger.info("Kicked off background IRS index refresh for %s", year)
+
+
+if __name__ == "__main__":
+    import argparse
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(description="IRS 990 index importer")
+    parser.add_argument("--year", type=int, help="Single submission year (e.g. 2024)")
+    parser.add_argument("--years-back", type=int, default=2,
+                        help="Refresh the last N+1 years (default 2 → current + 2 prior)")
+    parser.add_argument("--local", dest="local_dir",
+                        help="Directory holding index_{year}.csv files (skip download)")
+    parser.add_argument("--force", action="store_true", help="Skip TTL check")
+    args = parser.parse_args()
+    if args.year:
+        print(refresh_index_for_year(args.year, force=args.force, local_dir=args.local_dir))
+    else:
+        current_year = datetime.now(timezone.utc).year
+        for y in range(current_year - args.years_back, current_year + 1):
+            print(f"--- {y} ---")
+            print(refresh_index_for_year(y, force=args.force, local_dir=args.local_dir))

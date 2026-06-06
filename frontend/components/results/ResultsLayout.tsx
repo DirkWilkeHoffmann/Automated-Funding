@@ -26,7 +26,7 @@ interface ResultsCacheData {
   sourceFilter: string;
 }
 
-const RESULTS_CACHE_KEY = "results_cache_v3";
+const RESULTS_CACHE_KEY = "results_cache_v4";
 const RESULTS_FORCE_REFRESH_KEY = "results_force_refresh_v1";
 const STARRED_KEY = "results_starred_v1";
 const ARCHIVED_KEY = "results_archived_v1";
@@ -38,6 +38,10 @@ const eligibilityFilterOptions = [
   "Low Match",
   "Not Eligible",
 ];
+
+// Phase 1: default to strict — only surface results the engine stands behind.
+// Operators can lift this via the "Show all candidates" toggle.
+const STRICT_ELIGIBILITY_DEFAULT = ["Highly Eligible", "Eligible"];
 
 const detailFields = [
   { accessor: "applicant_types", label: "Applicant types" },
@@ -216,6 +220,12 @@ export function ResultsLayout() {
   const [lastRefreshedAt, setLastRefreshedAt] = useState<Date | null>(null);
   const [sourceFilter, setSourceFilter] = useState("all");
   const [autoDiscoveryEnabled, setAutoDiscoveryEnabled] = useState(false);
+  const [stats, setStats] = useState<{
+    surfaced: number;
+    candidates: number;
+    hedge: number;
+    excluded: number;
+  } | null>(null);
   const [checkedUrls, setCheckedUrls] = useState<Set<string>>(new Set());
   const [starredUrls, setStarredUrls] = useState<Set<string>>(new Set());
   const [archivedUrls, setArchivedUrls] = useState<Set<string>>(new Set());
@@ -240,13 +250,40 @@ export function ResultsLayout() {
   const filtersActive = activeFilterCount > 0;
 
   const resetFilters = useCallback(() => {
-    setEligibilityFilter(eligibilityFilterOptions);
+    // Resets to the strict default (matches first-run behaviour), not "all"
+    setEligibilityFilter(STRICT_ELIGIBILITY_DEFAULT);
     setSortMode("recent");
     setSearch("");
     setOnlyFutureDeadlines(false);
     setMinFunding("");
     setSourceFilter("all");
   }, []);
+
+  const showAllCandidates = useCallback(() => {
+    setEligibilityFilter(eligibilityFilterOptions);
+  }, []);
+
+  const refreshStats = useCallback(() => {
+    api
+      .stats()
+      .then((s) => {
+        const buckets = s?.funds?.by_eligibility || {};
+        setStats({
+          surfaced: (buckets["Highly Eligible"] || 0) + (buckets["Eligible"] || 0),
+          candidates: s?.funds?.total || 0,
+          hedge: buckets["Possibly Eligible"] || 0,
+          excluded: (buckets["Low Match"] || 0) + (buckets["Not Eligible"] || 0),
+        });
+      })
+      .catch(() => {});
+  }, []);
+
+  const isStrictView = useMemo(
+    () =>
+      eligibilityFilter.length === STRICT_ELIGIBILITY_DEFAULT.length &&
+      STRICT_ELIGIBILITY_DEFAULT.every((t) => eligibilityFilter.includes(t)),
+    [eligibilityFilter]
+  );
 
   const fetchLatest = useCallback(
     async (opts?: { showLoading?: boolean; forceRefresh?: boolean }) => {
@@ -292,9 +329,12 @@ export function ResultsLayout() {
         }
 
         setHasCachedData(Boolean(newRows.length));
-        setEligibilityFilter((prev) => (prev.length === 0 ? eligibilityFilterOptions : prev));
+        setEligibilityFilter((prev) =>
+          prev.length === 0 ? STRICT_ELIGIBILITY_DEFAULT : prev
+        );
         setError(null);
         setLastRefreshedAt(new Date());
+        refreshStats();
       } catch (err: any) {
         setError(err.message);
       } finally {
@@ -304,7 +344,7 @@ export function ResultsLayout() {
         setShouldForceRefresh(false);
       }
     },
-    []
+    [refreshStats]
   );
 
   // Hydrate from cache
@@ -313,7 +353,7 @@ export function ResultsLayout() {
     if (cached) {
       setData(cached.data || []);
       setEligibilityFilter(
-        cached.eligibilityFilter?.length > 0 ? cached.eligibilityFilter : eligibilityFilterOptions
+        cached.eligibilityFilter?.length > 0 ? cached.eligibilityFilter : STRICT_ELIGIBILITY_DEFAULT
       );
       setSortMode(cached.sortMode || "recent");
       setGroupBy(cached.groupBy || "none");
@@ -328,13 +368,14 @@ export function ResultsLayout() {
       // Seed seenUrls so next refresh can detect newly added items
       (cached.data || []).forEach((row, idx) => seenUrls.current.add(getRowKey(row, idx)));
     } else {
-      setEligibilityFilter(eligibilityFilterOptions);
+      setEligibilityFilter(STRICT_ELIGIBILITY_DEFAULT);
     }
     const flag = readCache<{ jobId?: string }>(RESULTS_FORCE_REFRESH_KEY)?.value;
     if (flag) setShouldForceRefresh(true);
     setHydratedCache(true);
 
     api.discoveryConfig().then((c: any) => setAutoDiscoveryEnabled(c?.enabled ?? false)).catch(() => {});
+    refreshStats();
 
     try {
       const starred = JSON.parse(localStorage.getItem(STARRED_KEY) || "[]");
@@ -626,6 +667,9 @@ export function ResultsLayout() {
         newCount={newResultKeys.size}
         lastRefreshedAt={lastRefreshedAt}
         autoDiscoveryEnabled={autoDiscoveryEnabled}
+        stats={stats}
+        isStrictView={isStrictView}
+        onShowAllCandidates={showAllCandidates}
       />
 
       <div className="card-base overflow-hidden">

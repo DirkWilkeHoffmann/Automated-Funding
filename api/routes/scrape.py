@@ -11,6 +11,9 @@ from api.schemas import (
     JobStatusResponse,
     PrepareUrlsRequest,
     PrepareUrlsResponse,
+    ScrapePreviewItem,
+    ScrapePreviewRequest,
+    ScrapePreviewResponse,
     ScrapeRequest,
     ScrapeResponse,
 )
@@ -58,6 +61,38 @@ def _prepare_urls_for_scrape(
         "duplicates_in_payload": duplicates_in_payload,
         "normalized_map": normalized_map,
     }
+
+
+@router.post("/preview", response_model=ScrapePreviewResponse, status_code=status.HTTP_200_OK)
+def preview_url(
+    payload: ScrapePreviewRequest,
+    _user=Depends(dependencies.require_user),
+) -> ScrapePreviewResponse:
+    """Inspect a URL and return whether it is a listing/aggregator page.
+
+    If ``type == "listing"``, the caller should show the user the extracted
+    URLs for selection before starting a scrape job.
+    If ``type == "single"``, the caller can proceed directly to scraping.
+    """
+    from utils.scraping import (
+        detect_listing_page,
+        extract_listing_urls,
+        extract_visible_text,
+        fetch_page,
+    )
+
+    url = str(payload.url).strip()
+    html = fetch_page(url)
+    if not html:
+        return ScrapePreviewResponse(type="single")
+
+    text = extract_visible_text(html)
+    if not detect_listing_page(url, text):
+        return ScrapePreviewResponse(type="single")
+
+    raw_items = extract_listing_urls(url)
+    items = [ScrapePreviewItem(url=item["url"], title=item["title"]) for item in raw_items]
+    return ScrapePreviewResponse(type="listing", items=items, count=len(items))
 
 
 @router.post("/prepare", response_model=PrepareUrlsResponse, status_code=status.HTTP_200_OK)

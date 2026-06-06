@@ -6,6 +6,7 @@ funds table plus helpers for writing new records and querying processed URLs.
 
 from __future__ import annotations
 
+import json
 import logging
 from functools import lru_cache
 from typing import List, Set
@@ -73,13 +74,27 @@ def get_processed_urls(force_refresh: bool = False) -> Set[str]:
     return set(_get_processed_urls_cached())
 
 
+def _serialize_value(v):
+    """Serialize a field value for Supabase insertion.
+
+    Dicts and lists are JSON-encoded so JSONB columns (e.g. match_rubric) receive
+    valid JSON rather than Python repr strings (str(dict) produces single-quote
+    syntax that is not valid JSON and cannot be stored in JSONB columns).
+    """
+    if v is None:
+        return None
+    if isinstance(v, (dict, list)):
+        return json.dumps(v)
+    return str(v)
+
+
 def append_funds(rows: List[dict]) -> None:
     """Insert fund records into Supabase and invalidate cache."""
     if not rows:
         return
     valid_cols = set(CSV_COLUMNS)
     cleaned = [
-        {k: (str(v) if v is not None else None) for k, v in row.items() if k in valid_cols}
+        {k: _serialize_value(v) for k, v in row.items() if k in valid_cols}
         for row in rows
     ]
     try:
@@ -92,7 +107,7 @@ def append_funds(rows: List[dict]) -> None:
 def upsert_fund(record: dict, existing_id: str = None) -> None:
     """Update an existing fund record by row ID, or insert if no ID provided."""
     valid_cols = set(CSV_COLUMNS)
-    cleaned = {k: (str(v) if v is not None else None) for k, v in record.items() if k in valid_cols}
+    cleaned = {k: _serialize_value(v) for k, v in record.items() if k in valid_cols}
     try:
         if existing_id:
             get_supabase().table("funds").update(cleaned).eq("id", existing_id).execute()

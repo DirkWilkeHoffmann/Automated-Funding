@@ -19,9 +19,13 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
+
+# Progress callback contract used by download_zip / fetch_multiple_xmls.
+# Signature: cb(message: str) -> None. Implementations should not raise.
+ZipProgressCallback = Callable[[str], None]
 
 logger = logging.getLogger(__name__)
 
@@ -69,20 +73,59 @@ def _is_fresh(path: Path) -> bool:
 
 
 def _prune_stale_cache() -> None:
-    """Best-effort eviction of ZIPs past TTL — keeps the cache dir small."""
+    """Best-effort eviction of stale cache files — keeps the cache dir small.
+
+    Cleans two kinds of leftovers:
+      * Successfully cached .zip files older than CACHE_TTL_HOURS.
+      * Orphaned .part files older than 1 hour. These leak when a download
+        process is killed mid-stream — the temp file is only unlinked inside
+        an exception handler, so SIGKILL leaves them behind. Long .part files
+        accumulate quickly (each is up to 500MB).
+    """
     if not CACHE_DIR.exists():
         return
-    cutoff = time.time() - CACHE_TTL_HOURS * 3600
+    zip_cutoff = time.time() - CACHE_TTL_HOURS * 3600
     for p in CACHE_DIR.glob("*.zip"):
         try:
-            if p.stat().st_mtime < cutoff:
+            if p.stat().st_mtime < zip_cutoff:
                 p.unlink()
         except OSError:
             pass
 
+    # Phase 8 fix #3: clean orphaned in-progress download files.
+    # 1 hour is well past any real download (largest IRS ZIP < 500MB → < 5 min
+    # on a typical connection at 50Mbps); anything older is an abandoned tmp.
+    part_cutoff = time.time() - 3600
+    cleaned_bytes = 0
+    cleaned_count = 0
+    for p in CACHE_DIR.glob("*.part"):
+        try:
+            st = p.stat()
+            if st.st_mtime < part_cutoff:
+                cleaned_bytes += st.st_size
+                p.unlink()
+                cleaned_count += 1
+        except OSError:
+            pass
+    if cleaned_count:
+        logger.info(
+            "Cleaned %d orphaned .part files (%.1f MB)",
+            cleaned_count, cleaned_bytes / 1_000_000,
+        )
 
-def download_zip(batch_zip: str, submission_year: int) -> Optional[Path]:
-    """Download an IRS batch ZIP (or return cached path)."""
+
+def download_zip(
+    batch_zip: str,
+    submission_year: int,
+    *,
+    progress_cb: Optional[ZipProgressCallback] = None,
+) -> Optional[Path]:
+    """Download an IRS batch ZIP (or return cached path).
+
+    If `progress_cb` is supplied, it is called with status strings during the
+    download — roughly every 2 MB of stream data — so callers can plumb the
+    progress up to a user-facing UI. Cached returns are silent.
+    """
     path = _cache_path(batch_zip)
     if _is_fresh(path):
         return path
@@ -93,18 +136,50 @@ def download_zip(batch_zip: str, submission_year: int) -> Optional[Path]:
             return path
         url = _zip_url(batch_zip, submission_year)
         logger.info("Downloading IRS ZIP %s (~70MB)", batch_zip)
+        if progress_cb:
+            try:
+                progress_cb(f"downloading {batch_zip} (starting)")
+            except Exception:
+                pass
         try:
             with requests.get(url, headers=_HEADERS, stream=True, timeout=300) as resp:
                 resp.raise_for_status()
+                # Total size header (may be absent for chunked transfers)
+                try:
+                    total_bytes = int(resp.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    total_bytes = 0
                 # Stream to a temp file in the same dir then atomic-move so a
                 # failed download doesn't poison the cache
                 tmp = tempfile.NamedTemporaryFile(
                     dir=CACHE_DIR, delete=False, suffix=".zip.part"
                 )
                 try:
+                    downloaded = 0
+                    # Emit a progress tick every ~2MB to keep the UI alive
+                    # without flooding the progress channel.
+                    tick_step = 2 * 1024 * 1024
+                    next_tick = tick_step
                     for chunk in resp.iter_content(chunk_size=1 << 16):
                         if chunk:
                             tmp.write(chunk)
+                            downloaded += len(chunk)
+                            if progress_cb and downloaded >= next_tick:
+                                mb = downloaded / 1_000_000
+                                if total_bytes:
+                                    total_mb = total_bytes / 1_000_000
+                                    pct = int(downloaded * 100 / total_bytes)
+                                    msg = (
+                                        f"downloading {batch_zip} "
+                                        f"({mb:.0f}/{total_mb:.0f}MB, {pct}%)"
+                                    )
+                                else:
+                                    msg = f"downloading {batch_zip} ({mb:.0f}MB)"
+                                try:
+                                    progress_cb(msg)
+                                except Exception:
+                                    pass
+                                next_tick += tick_step
                     tmp.close()
                     os.replace(tmp.name, path)
                 except Exception:
@@ -198,11 +273,17 @@ def extract_xml(batch_zip_path: Path, object_id: str) -> Optional[str]:
 
 def fetch_multiple_xmls(
     filings: Iterable[Tuple[str, str, int]],
+    *,
+    progress_cb: Optional[ZipProgressCallback] = None,
 ) -> Dict[str, str]:
     """Batch-aware fetch: group by ZIP, download each at most once.
 
     Args:
         filings: iterable of (object_id, batch_zip, submission_year) tuples.
+        progress_cb: optional callable invoked with status strings
+            ("downloading X (Y/Z MB, P%)") during streaming downloads. Lets
+            the UI show movement during multi-minute ZIP fetches instead of
+            looking frozen on a stale "fetching XMLs" message.
 
     Returns:
         dict: object_id → xml_text (only successful entries are included).
@@ -238,7 +319,7 @@ def fetch_multiple_xmls(
         )
 
     for (batch_zip, submission_year), object_ids in cached_batches + fresh_to_fetch:
-        path = download_zip(batch_zip, submission_year)
+        path = download_zip(batch_zip, submission_year, progress_cb=progress_cb)
         if path is None:
             continue
         for oid in object_ids:

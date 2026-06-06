@@ -28,6 +28,36 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SCRAPE_LOG_DIR = os.path.join(_REPO_ROOT, "logs", "scrape")
 
 
+def _write_fund_log_scrape_start(
+    url: str,
+    raw_text: str,
+    visited_urls: list,
+    pages_scraped: int,
+) -> None:
+    """Reset the per-fund consolidated log and write the SCRAPE section.
+
+    Must be called BEFORE call_llm_extract so the file is cleared before LLM
+    phases begin appending. Calling it after LLM would truncate their output.
+    """
+    try:
+        from utils.llm_utils import LLM_DEBUG_LOGGING, write_fund_log_section
+        if not LLM_DEBUG_LOGGING:
+            return
+        scrape_body_lines = [
+            f"URL        : {url}",
+            f"PAGES      : {pages_scraped}",
+            f"VISITED    : {len(visited_urls)}",
+            f"TEXT LEN   : {len(raw_text)} chars",
+            "",
+            "VISITED URLS:",
+        ]
+        scrape_body_lines.extend(f"  {vu}" for vu in visited_urls)
+        scrape_body_lines.extend(["", "── RAW SCRAPED TEXT ──", raw_text])
+        write_fund_log_section(url, "SCRAPE", "\n".join(scrape_body_lines), reset=True)
+    except Exception as exc:
+        logger.warning("Could not write scrape start log for %s: %s", url, exc)
+
+
 def _write_scrape_log(
     url: str,
     raw_text: str,
@@ -35,24 +65,45 @@ def _write_scrape_log(
     pages_scraped: int,
     extracted: dict,
 ) -> None:
-    """Write a per-URL scrape log showing raw fetched text + extracted fields.
+    """Append the FINAL EXTRACTED FIELDS section to the per-fund log, and write
+    the legacy split log.
 
-    Files land at logs/scrape/{url_safe}.txt and are overwritten on each rescrape.
-    Set LLM_DEBUG_LOGGING=False in llm_utils to suppress all debug output.
+    The SCRAPE section (with reset=True) is written separately by
+    _write_fund_log_scrape_start BEFORE LLM extraction so that LLM Phase 1/2
+    sections append to a freshly cleared file. This function is called AFTER
+    LLM extraction and only appends.
     """
     try:
-        from utils.llm_utils import LLM_DEBUG_LOGGING
+        from utils.llm_utils import LLM_DEBUG_LOGGING, write_fund_log_section
         if not LLM_DEBUG_LOGGING:
             return
         from utils.utils_helpers import safe_filename_from_url
 
+        # ── Consolidated per-fund log — FINAL EXTRACTED FIELDS (append) ───
+        skip = {"pdf_text", "content_hash", "visited_urls", "match_rubric"}
+        fields_lines = []
+        for k, v in extracted.items():
+            if k in skip:
+                continue
+            fields_lines.append(f"  {k:<28}: {v}")
+        # Render the rubric as a compact table at the end.
+        rubric = extracted.get("match_rubric") or {}
+        if rubric:
+            fields_lines.append("")
+            fields_lines.append("RUBRIC:")
+            for dim, entry in rubric.items():
+                if isinstance(entry, dict):
+                    v = entry.get("verdict", "?")
+                    e = (entry.get("evidence") or "")[:120]
+                    fields_lines.append(f"  {dim:<22} {v:<10} {e}")
+        write_fund_log_section(url, "FINAL EXTRACTED FIELDS", "\n".join(fields_lines))
+
+        # ── Legacy split log (kept for backwards compat) ───────────────────
         os.makedirs(_SCRAPE_LOG_DIR, exist_ok=True)
         url_safe = safe_filename_from_url(url)
         log_path = os.path.join(_SCRAPE_LOG_DIR, f"{url_safe}.txt")
-
         sep = "=" * 100
         thin = "-" * 60
-
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(f"{sep}\n")
             f.write("SCRAPE LOG\n")
@@ -67,9 +118,8 @@ def _write_scrape_log(
             f.write(f"\n{thin}\nRAW SCRAPED TEXT:\n{thin}\n")
             f.write(raw_text)
             f.write(f"\n\n{sep}\nEXTRACTED FIELDS (LLM output):\n{thin}\n")
-            skip = {"pdf_text", "content_hash", "visited_urls"}
             for k, v in extracted.items():
-                if k not in skip:
+                if k not in {"pdf_text", "content_hash", "visited_urls"}:
                     f.write(f"  {k:<28}: {v}\n")
             f.write(f"{sep}\n")
     except Exception as exc:
@@ -284,6 +334,12 @@ def process_single_fund(
 
         # Capture raw crawled text before doc-context is appended (for the scrape log).
         raw_crawled_text = text
+
+        # Reset the per-fund log and write the SCRAPE section NOW, before LLM
+        # extraction begins. LLM Phase 1/2 will append their sections afterwards.
+        # If this call were placed after call_llm_extract, reset=True would erase
+        # the LLM sections that had already been written.
+        _write_fund_log_scrape_start(url, raw_crawled_text, visited_urls, pages_scraped)
 
         # Append any pre-extracted 990 / document summaries from the discovery phase.
         doc_context = _get_document_summaries(url)

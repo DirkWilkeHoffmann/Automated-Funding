@@ -99,3 +99,10 @@ _archive/
 logs/
 page*
 .superpowers*
+
+/graphify-out/
+
+.env*
+
+migration*
+/data/*
