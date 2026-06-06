@@ -442,3 +442,23 @@ class ScrapePreviewResponse(BaseModel):
     type: Literal["listing", "single"]
     items: List[ScrapePreviewItem] = Field(default_factory=list)
     count: int = 0
+
+
+# ── Pending URLs schemas ─────────────────────────────────────────────────────
+
+
+class PendingUrlItem(BaseModel):
+    id: str
+    url: str
+    title: Optional[str] = None
+    source_url: Optional[str] = None
+    status: str
+    created_at: Optional[str] = None
+
+
+class ApprovePendingRequest(BaseModel):
+    ids: List[str]
+
+
+class RejectPendingRequest(BaseModel):
+    ids: List[str]
