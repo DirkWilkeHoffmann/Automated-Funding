@@ -16,9 +16,10 @@ import pandas as pd
 from utils.constants import CSV_COLUMNS, SAVE_DIR
 from utils.data_processing import clear_results_cache
 from utils.db.funds_store import append_funds, upsert_fund
+from utils.db.pending_urls_store import upsert_pending_urls as _upsert_pending
 from utils.llm_utils import call_llm_extract
 from utils.models import ScrapeProgress
-from utils.scraping import fetch_page, prioritized_crawl
+from utils.scraping import detect_listing_page, extract_listing_urls, fetch_page, prioritized_crawl
 from utils.utils_helpers import log_message, safe_filename_from_url
 
 logger = logging.getLogger(__name__)
@@ -346,8 +347,33 @@ def process_single_fund(
         if doc_context:
             text = text + "\n\n" + doc_context
             log_message(f"Injected document context ({len(doc_context)} chars) for {url}", "info")
+
+        # Listing page detection — fires before LLM to avoid garbage extraction
+        if detect_listing_page(url, text):
+            sub_items = extract_listing_urls(url)
+            if sub_items:
+                n = _upsert_pending(sub_items, source_url=url)
+                log_message(
+                    f"Listing page: {len(sub_items)} sub-URLs queued for review from {url}",
+                    "info",
+                )
+            else:
+                log_message(f"Listing page detected at {url} but no sub-URLs extracted", "warning")
+            result["skipped"] = "listing_page"
+            result["error"] = ""
+            _do_persist = False
+            return result
+
         data = call_llm_extract(text, fund_url=url)
         result.update(data)
+
+        # Apply fund name priority: passed-in param > Stage 1 extracted > netloc fallback
+        _s1_name = data.get("stage1_fund_name", "").strip()
+        if result.get("fund_name") == urlparse(url).netloc and _s1_name:
+            result["fund_name"] = _s1_name
+        # Remove the internal staging key — not a DB column
+        result.pop("stage1_fund_name", None)
+
         result["pages_scraped"] = pages_scraped
         result["visited_urls_count"] = len(visited_urls)
         result["error"] = ""
