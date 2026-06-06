@@ -37,6 +37,30 @@ logger = logging.getLogger(__name__)
 
 _html_cache: "OrderedDict[str, Tuple[str, float]]" = OrderedDict()
 
+_JUNK_PATTERNS = (
+    "comment-page-", "replytocom=", "share=", "like=",
+    "action=share", "utm_",
+)
+
+_GRANT_PATH_KEYWORDS = frozenset({
+    "grant", "apply", "fund", "giving", "invest",
+    "opportunity", "award", "support", "programme", "program",
+    "donate", "philanthropy", "funding",
+})
+
+_PLAYWRIGHT_WORD_THRESHOLD = 150
+
+
+def _is_junk_url(url: str) -> bool:
+    """Return True for comment pages, social share variants, and tracking URLs."""
+    lower = url.lower()
+    return any(p in lower for p in _JUNK_PATTERNS)
+
+
+def _word_count(text: str) -> int:
+    """Return the number of whitespace-separated words in text."""
+    return len(text.split())
+
 
 def _is_safe_url(url: str) -> bool:
     """Return True only when the URL is safe to fetch.
@@ -208,6 +232,8 @@ def discover_links(
                 continue
 
             hnorm = normalize_url(href)
+            if _is_junk_url(hnorm):
+                continue
             anchor = (a.get_text(" ", strip=True) or "").strip()
             meta = candidates.setdefault(
                 hnorm, {"anchor_texts": set(), "source_titles": set(), "source_snippets": set()}
@@ -290,10 +316,20 @@ def prioritized_crawl(seed_url: str) -> Tuple[str, str, int, List[str], Dict[str
           /education/apply-for-da-young-leaders-OTHER    → False (sibling at same depth)
           /individuals/apply-for-henry-moore             → False (different branch)
           /                                              → False
+
+        Root URL rule:
+          For root URLs (seed_path=""), allow the seed itself OR depth-1 pages
+          whose path segment contains a grant-related keyword (e.g. /grants, /apply).
         """
         if not seed_path:
-            # Seed is a root URL — only the seed itself matches the rule.
-            return candidate_url == seed_norm
+            # Root URL — allow exact seed OR depth-1 pages with grant-related path keywords
+            if candidate_url == seed_norm:
+                return True
+            cand_path = urlparse(candidate_url).path.lower().rstrip("/")
+            path_parts = [p for p in cand_path.split("/") if p]
+            if len(path_parts) == 1 and any(kw in path_parts[0] for kw in _GRANT_PATH_KEYWORDS):
+                return True
+            return False
         cand_path = urlparse(candidate_url).path.rstrip("/")
         if cand_path == seed_path:
             return True
