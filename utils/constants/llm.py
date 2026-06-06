@@ -47,11 +47,100 @@ LLM_SYSTEM_PROMPT = (
 )
 
 
-# Phase 2 fires for any tier in this set. "Not Eligible" is excluded — hard
-# vetoes (geography, for-profit-only, etc.) don't need enrichment. Everything
-# else gets the full details pass so operators always see the rich evidence
-# panel regardless of how the fund scored.
-PHASE2_PROMOTE_TIERS = {"Highly Eligible", "Eligible", "Possibly Eligible", "Low Match"}
+LLM_PROMPT_STAGE1 = """Extract structured facts from the funding opportunity text below.
+
+YOUR ONLY JOB IS EXTRACTION. Do not evaluate eligibility. Do not reference any applicant organisation.
+
+=== GRANT PAGE TEXT ===
+{text}
+=== END OF GRANT PAGE TEXT ===
+
+Return ONLY a valid JSON object with EXACTLY these keys:
+
+{{
+  "fund_name": "Name of this specific grant or fund programme (not the funder organisation name). Empty string if not stated.",
+  "funder_name": "Name of the organisation offering the grant. Empty string if not found.",
+  "geographic_scope": "Full geographic scope including BOTH sub-region names AND country name when both appear. Examples: 'Eastern Cape, Western Cape, South Africa' | 'Georgia, United States' | 'Global' | 'Not stated'. Never drop the country name when it appears.",
+  "us_state_scope": ["TX", "CA"],
+  "applicant_types": ["registered charities", "NGOs"],
+  "topic_areas": ["education", "vocational training", "economic development"],
+  "beneficiaries": ["unemployed youth", "low-income families"],
+  "funding_range": "Explicit amounts if stated (e.g. '$10,000-$50,000', 'up to R500,000'). 'Not stated' ONLY if no amount appears.",
+  "deadline": "Application deadline if stated (e.g. '30-Apr-2026', 'rolling'). 'Not stated' ONLY if no date appears.",
+  "application_status": "MUST be one of: open|closed|paused|rolling|seasonal|unclear",
+  "restrictions": ["must be locally registered", "no faith-based organisations"],
+  "grant_type": "federal | foundation | corporate | community | other",
+  "application_process": "How to apply — portal, LOI, email, invitation only, etc. Empty string if not stated.",
+  "notes": "Any other relevant facts. Empty string if none."
+}}
+
+RULES:
+- Extract ONLY what is EXPLICITLY STATED in the text above.
+- If a field does not appear, use an empty string or empty array. Do NOT guess or infer.
+- The example values above are ILLUSTRATIVE ONLY — replace every field with what the text actually says.
+- Do NOT include any information about an applicant organisation.
+- Return ONLY the JSON object. No explanation."""
+
+
+LLM_PROMPT_STAGE2 = """Evaluate whether the funding opportunity described below is a good fit for the applicant organisation. You have been given pre-extracted fund facts — do NOT attempt to re-extract from raw text.
+
+=== APPLICANT ORGANISATION ===
+{org_profile}
+
+=== APPLICANT TYPE RULES ===
+The org holds these registrations: 501(c)(3) [US federal nonprofit] and NPO [South African Non-Profit Organisation].
+When scoring applicant_type:
+- A fund open to "nonprofits", "501(c)(3)", "charities", "NGOs", "civil society", or "NPOs" → org QUALIFIES (match).
+- Score `mismatch` ONLY for hard exclusions: "for-profit only", "government agencies only", or explicit bars on foreign-registered orgs.
+- A locale-specific label (e.g. "South African NPO") does NOT by itself imply mismatch when the org's accreditations cover that locale.
+
+=== PRE-EXTRACTED FUND FACTS ===
+Fund name: {fund_name}
+Funder: {funder_name}
+Geographic scope (raw text): {geographic_scope}
+Geography verdict (system-computed — copy verbatim into rubric): {geo_verdict_text}
+Applicant types accepted: {applicant_types}
+Topic areas: {topic_areas}
+Beneficiaries: {beneficiaries}
+Funding range: {funding_range}
+Application status: {application_status}
+Restrictions: {restrictions}
+Grant type: {grant_type}
+=== END OF FUND FACTS ===
+
+=== ELIGIBILITY SCALE ===
+"Highly Eligible"   — No veto mismatch AND ≥6 of 8 dimensions match.
+"Eligible"          — No veto mismatch AND ≥3 match (≤1 non-veto mismatch).
+"Possibly Eligible" — No veto mismatch AND 2 match.
+"Low Match"         — No veto mismatch, fewer than 2 match.
+"Not Eligible"      — ANY veto dimension is `mismatch`.
+Veto dimensions: geography, applicant_type, org_history, cost_share, explicit_exclusion.
+
+Score EXACTLY 7 rubric dimensions. Geography verdict is pre-computed above — emit it verbatim.
+
+Return ONLY a valid JSON object:
+
+{{
+  "rubric": {{
+    "geography":          {{"verdict": "unknown", "evidence": "system-computed — see geography verdict above"}},
+    "applicant_type":     {{"verdict": "match|partial|mismatch|unknown", "evidence": "one-sentence quote from fund facts"}},
+    "topic_focus":        {{"verdict": "match|partial|mismatch|unknown", "evidence": "..."}},
+    "beneficiary":        {{"verdict": "match|partial|mismatch|unknown", "evidence": "..."}},
+    "org_history":        {{"verdict": "match|partial|mismatch|unknown", "evidence": "..."}},
+    "grant_size":         {{"verdict": "match|partial|mismatch|unknown", "evidence": "..."}},
+    "cost_share":         {{"verdict": "match|partial|mismatch|unknown", "evidence": "..."}},
+    "explicit_exclusion": {{"verdict": "match|partial|mismatch|unknown", "evidence": "..."}}
+  }},
+  "eligibility": "Highly Eligible | Eligible | Possibly Eligible | Low Match | Not Eligible",
+  "evidence": "VERDICT: [tier] — [one sentence citing the most decisive rubric dimension(s)]"
+}}
+
+Return ONLY the JSON object."""
+
+
+# Phase 2 enrichment fires only for tiers worth pursuing.
+# "Low Match" and "Not Eligible" are excluded — not worth the API cost.
+PHASE2_PROMOTE_TIERS = {"Highly Eligible", "Eligible", "Possibly Eligible"}
 
 
 LLM_PROMPT = """Evaluate the funding opportunity below against the organisation profile provided. Extract structured data, score each rubric dimension, then assess overall eligibility.
