@@ -5,7 +5,7 @@ import logging
 import os
 from datetime import datetime
 from functools import lru_cache
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
 
@@ -386,77 +386,179 @@ def _format_rich_evidence(*, phase1_evidence: str, tier: str, phase2: Dict[str, 
     return "\n".join(lines).rstrip()
 
 
+# Maps continental scope terms to a continent identifier.
+# Sorted longest-first so "sub-saharan africa" matches before "africa".
+_CONTINENTAL_TERMS: List[tuple] = sorted([
+    ("sub-saharan africa", "africa"),
+    ("east africa", "africa"),
+    ("eastern africa", "africa"),
+    ("southern africa", "africa"),
+    ("west africa", "africa"),
+    ("western africa", "africa"),
+    ("north africa", "africa"),
+    ("northern africa", "africa"),
+    ("central africa", "africa"),
+    ("latin america", "latin america"),
+    ("central america", "latin america"),
+    ("south america", "latin america"),
+    ("north america", "north america"),
+    ("southeast asia", "asia"),
+    ("south asia", "asia"),
+    ("east asia", "asia"),
+    ("middle east", "middle east"),
+    ("africa", "africa"),
+    ("asia", "asia"),
+    ("europe", "europe"),
+], key=lambda x: -len(x[0]))
+
+# Maps country (lowercase) to continent identifier.
+_COUNTRY_CONTINENT: Dict[str, str] = {
+    "south africa": "africa", "kenya": "africa", "namibia": "africa",
+    "ethiopia": "africa", "nigeria": "africa", "ghana": "africa",
+    "tanzania": "africa", "uganda": "africa", "zimbabwe": "africa",
+    "mozambique": "africa", "zambia": "africa", "malawi": "africa",
+    "botswana": "africa", "rwanda": "africa", "senegal": "africa",
+    "cameroon": "africa", "angola": "africa", "egypt": "africa",
+    "honduras": "latin america", "mexico": "latin america",
+    "guatemala": "latin america", "el salvador": "latin america",
+    "nicaragua": "latin america", "costa rica": "latin america",
+    "panama": "latin america", "colombia": "latin america",
+    "brazil": "latin america", "peru": "latin america",
+    "united states": "north america", "canada": "north america",
+    "india": "asia", "cambodia": "asia", "bangladesh": "asia",
+    "nepal": "asia", "philippines": "asia", "indonesia": "asia",
+    "china": "asia", "vietnam": "asia", "thailand": "asia",
+    "united kingdom": "europe", "germany": "europe", "france": "europe",
+    "netherlands": "europe", "sweden": "europe", "norway": "europe",
+}
+
+# Known sub-national divisions per country (lowercase).
+# Used to distinguish "KwaZulu-Natal, South Africa" (SA province → partial)
+# from "London, Northern Ireland, South Africa" (UK regions → ignore).
+_COUNTRY_SUBDIVISIONS: Dict[str, frozenset] = {
+    "south africa": frozenset({
+        "eastern cape", "western cape", "northern cape", "north west",
+        "gauteng", "limpopo", "mpumalanga", "kwazulu-natal", "kwazulu natal",
+        "free state", "kzn",
+    }),
+    "united states": frozenset({
+        "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+        "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
+        "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana",
+        "maine", "maryland", "massachusetts", "michigan", "minnesota",
+        "mississippi", "missouri", "montana", "nebraska", "nevada",
+        "new hampshire", "new jersey", "new mexico", "new york",
+        "north carolina", "north dakota", "ohio", "oklahoma", "oregon",
+        "pennsylvania", "rhode island", "south carolina", "south dakota",
+        "tennessee", "texas", "utah", "vermont", "virginia", "washington",
+        "west virginia", "wisconsin", "wyoming", "dc", "district of columbia",
+    }),
+    "kenya": frozenset({
+        "nairobi", "mombasa", "kisumu", "nakuru", "eldoret",
+        "central", "coast", "nyanza", "rift valley", "eastern", "north eastern",
+    }),
+    "ethiopia": frozenset({
+        "addis ababa", "oromia", "amhara", "tigray", "snnpr", "somali",
+        "afar", "benishangul-gumuz", "gambela", "harari", "dire dawa",
+    }),
+    "namibia": frozenset({
+        "khomas", "erongo", "hardap", "karas", "kavango", "kunene",
+        "ohangwena", "omaheke", "omusati", "oshana", "oshikoto",
+        "otjozondjupa", "zambezi",
+    }),
+}
+
+
 def _compute_geography_verdict(
     geographic_scope: str,
     *,
     service_countries: list,
     service_regions: Dict[str, list],
 ) -> Dict[str, str]:
-    """Deterministically compute the geography rubric verdict in Python.
-
-    The LLM cannot reliably cross-reference service_countries against fund text
-    (it hallucinates mismatches ~100% of the time for non-HQ countries). We
-    bypass the LLM for this dimension entirely.
+    """Deterministically compute the geography rubric verdict.
 
     Algorithm:
-      1. Global / not-stated scope → unknown
-      2. Find the fund's country by substring-matching service_country names
-         in the scope text.
-      3. If not found directly, infer country from org sub-region names that
-         appear in the scope (e.g. "Eastern Cape" → South Africa).
-      4. Apply the three-level sub-region logic.
+      1. Unknown/empty scope → unknown
+      2. Global terms → match
+      3. Country name match → sub-region logic
+      4. No country match → try continental terms
+      5. Still no match → unknown
     """
+    import re as _re
+
     scope = (geographic_scope or "").strip()
     scope_lower = scope.lower()
 
-    _UNKNOWN = {"not stated", "not_stated", "not applicable", "n/a", ""}
-    _GLOBAL = {"worldwide", "global", "international", "all countries", "anywhere"}
+    _UNKNOWN_TERMS = {"not stated", "not_stated", "not applicable", "n/a", ""}
+    _GLOBAL_TERMS = {"worldwide", "global", "international", "all countries", "anywhere"}
 
-    if scope_lower in _UNKNOWN:
+    if scope_lower in _UNKNOWN_TERMS:
         return {"verdict": "unknown", "evidence": "Geographic scope not stated"}
-    if any(t in scope_lower for t in _GLOBAL):
+    if any(t in scope_lower for t in _GLOBAL_TERMS):
         return {"verdict": "match", "evidence": f"Fund has global/international scope: '{scope}'"}
 
-    # Build country lookup: lower-name → canonical
+    # Build country lookup: lowercase name → canonical name
     country_map = {str(c).strip().lower(): str(c).strip() for c in service_countries if str(c).strip()}
 
-    # Build sub-region lookup: region_lower → canonical_country (only org's known regions)
+    # Build region lookups
     region_to_country: Dict[str, str] = {}
-    # Also: canonical_country_lower → [region_lower, ...]
     country_regions: Dict[str, list] = {}
     for ctry_raw, regions in service_regions.items():
-        canonical_ctry = country_map.get(str(ctry_raw).strip().lower())
-        if not canonical_ctry:
+        canonical = country_map.get(str(ctry_raw).strip().lower())
+        if not canonical:
             continue
-        ctry_l = canonical_ctry.lower()
+        ctry_l = canonical.lower()
         country_regions.setdefault(ctry_l, [])
         for r in (regions or []):
             r_l = str(r).strip().lower()
             if r_l:
-                region_to_country[r_l] = canonical_ctry
+                region_to_country[r_l] = canonical
                 country_regions[ctry_l].append(r_l)
 
-    # Step 1: find fund country by direct name match
+    # Step 3a: find fund country by direct name match
     matched_country: Optional[str] = None
     for ctry_l, ctry_canonical in country_map.items():
         if ctry_l in scope_lower:
             matched_country = ctry_canonical
             break
 
-    # Step 2: find org sub-regions present in the scope
+    # Step 3b: find org sub-regions present in scope
     scope_org_regions = [r_l for r_l in region_to_country if r_l in scope_lower]
 
-    # Step 3: infer country from sub-regions if not found directly
+    # Step 3c: infer country from sub-regions
     if matched_country is None and scope_org_regions:
         matched_country = region_to_country[scope_org_regions[0]]
 
+    # Step 4: continental fallback (only when no specific country matched)
     if matched_country is None:
+        org_continents = {_COUNTRY_CONTINENT.get(c.lower()) for c in service_countries if c}
+        for term, continent in _CONTINENTAL_TERMS:
+            if term in scope_lower:
+                if continent in org_continents:
+                    matched_orgs = [
+                        c for c in service_countries
+                        if _COUNTRY_CONTINENT.get(c.lower()) == continent
+                    ]
+                    return {
+                        "verdict": "match",
+                        "evidence": (
+                            f"Fund scope '{scope}' covers {continent}; "
+                            f"org operates in {matched_orgs}"
+                        ),
+                    }
+                return {
+                    "verdict": "unknown",
+                    "evidence": (
+                        f"Fund scope '{scope}' covers {continent} but org has "
+                        f"no service_countries on that continent"
+                    ),
+                }
         return {
             "verdict": "unknown",
             "evidence": f"Cannot map scope '{scope}' to any service country — treating as unknown",
         }
 
-    # Step 4: sub-region logic
+    # Step 5: sub-region logic for matched_country
     org_regions = country_regions.get(matched_country.lower(), [])
 
     if not org_regions:
@@ -466,7 +568,6 @@ def _compute_geography_verdict(
         }
 
     if scope_org_regions:
-        # At least one of the org's listed regions appears in the fund scope
         return {
             "verdict": "match",
             "evidence": (
@@ -475,26 +576,40 @@ def _compute_geography_verdict(
             ),
         }
 
-    # Fund's scope names the country but no specific org region matches.
-    # Check whether the scope is purely country-level or names other specific regions.
-    scope_residual = scope_lower
-    for ctry_l in country_map:
-        scope_residual = scope_residual.replace(ctry_l, "")
-    scope_residual = scope_residual.strip(" ,.-/()")
+    # No org sub-regions in scope. Determine if the residual text is:
+    #   a) a known sub-division of matched_country → partial
+    #   b) regions of other countries → match (other-country text, not a restriction)
+    scope_residual = scope_lower.replace(matched_country.lower(), "").strip(" ,.-/()")
 
     if not scope_residual:
-        # Scope is just the country name (no sub-region specified) → country-level match
         return {
             "verdict": "match",
             "evidence": f"Fund targets '{matched_country}' at country level; org operates there",
         }
 
-    # Fund names specific sub-regions that don't overlap org's listed regions
+    known_subs = _COUNTRY_SUBDIVISIONS.get(matched_country.lower(), frozenset())
+    residual_tokens = [t for t in _re.split(r"[\s,.\-/()/]+", scope_residual.lower()) if t]
+
+    # Check if any residual token (or multi-word combo) matches a known sub-division
+    residual_joined = " ".join(residual_tokens)
+    has_known_subdivision = any(sub in residual_joined for sub in known_subs)
+
+    if has_known_subdivision:
+        return {
+            "verdict": "partial",
+            "evidence": (
+                f"'{matched_country}' is in service_countries but fund targets specific "
+                f"sub-regions not in org's listed regions "
+                f"{[r.title() for r in org_regions]}"
+            ),
+        }
+
+    # Residual contains no known sub-divisions of matched_country → other-country text
     return {
-        "verdict": "partial",
+        "verdict": "match",
         "evidence": (
-            f"'{matched_country}' is in service_countries but fund's specific regions "
-            f"don't overlap org's listed regions {[r.title() for r in org_regions]}"
+            f"Fund explicitly targets '{matched_country}'; "
+            f"other text in scope refers to other countries"
         ),
     }
 
