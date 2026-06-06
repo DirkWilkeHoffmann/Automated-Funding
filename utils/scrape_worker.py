@@ -265,6 +265,7 @@ def process_single_fund(
     """
     if fund_name:
         fund_name = fund_name.strip()
+    _fund_name_was_supplied = bool(fund_name)
     result: dict = {
         "fund_url": url,
         "extraction_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -350,18 +351,22 @@ def process_single_fund(
 
         # Listing page detection — fires before LLM to avoid garbage extraction
         if detect_listing_page(url, text):
-            sub_items = extract_listing_urls(url)
+            _do_persist = False  # set before extract_listing_urls to guard against exceptions
+            try:
+                sub_items = extract_listing_urls(url)
+            except Exception as exc:
+                log_message(f"extract_listing_urls failed for {url}: {exc}", "warning")
+                sub_items = []
             if sub_items:
                 n = _upsert_pending(sub_items, source_url=url)
                 log_message(
-                    f"Listing page: {len(sub_items)} sub-URLs queued for review from {url}",
+                    f"Listing page: {n}/{len(sub_items)} sub-URLs queued for review from {url}",
                     "info",
                 )
             else:
                 log_message(f"Listing page detected at {url} but no sub-URLs extracted", "warning")
             result["skipped"] = "listing_page"
             result["error"] = ""
-            _do_persist = False
             return result
 
         data = call_llm_extract(text, fund_url=url)
@@ -369,7 +374,8 @@ def process_single_fund(
 
         # Apply fund name priority: passed-in param > Stage 1 extracted > netloc fallback
         _s1_name = data.get("stage1_fund_name", "").strip()
-        if result.get("fund_name") == urlparse(url).netloc and _s1_name:
+        _netloc = urlparse(url).netloc
+        if not _fund_name_was_supplied and result.get("fund_name") == _netloc and _s1_name:
             result["fund_name"] = _s1_name
         # Remove the internal staging key — not a DB column
         result.pop("stage1_fund_name", None)
