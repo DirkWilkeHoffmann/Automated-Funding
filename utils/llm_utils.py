@@ -363,7 +363,7 @@ def call_llm_extract(text: str, fund_url: str = "") -> Dict[str, Any]:
 
     # ── Phase 2 enrichment (only for promising tiers) ─────────────────────
     evidence = s2.get("evidence", "")
-    if tier in PHASE2_PROMOTE_TIERS and len(text) > 2000:
+    if tier in PHASE2_PROMOTE_TIERS:
         phase2 = _phase2_enrich(
             client,
             text=text,
@@ -397,6 +397,7 @@ def call_llm_extract(text: str, fund_url: str = "") -> Dict[str, Any]:
         "notes": s1.get("notes", ""),
         "grant_type": s1.get("grant_type", "other"),
         "funder_name": s1.get("funder_name", ""),
+        "topic_areas": _join_list(s1.get("topic_areas")),
         "stage1_fund_name": s1.get("fund_name_extracted", ""),
         "match_rubric": rubric,
         "eligibility": tier,
