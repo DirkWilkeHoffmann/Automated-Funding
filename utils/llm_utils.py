@@ -173,6 +173,151 @@ def get_client() -> Optional[OpenAI]:
         return None
 
 
+def stage1_extract(text: str, *, client: "OpenAI", fund_url: str = "") -> Dict[str, Any]:
+    """Stage 1: extract objective fund facts. No org profile in prompt."""
+    from utils.constants.llm import LLM_PROMPT_STAGE1, LLM_SYSTEM_PROMPT
+
+    if len(text) > _MAX_CHARS:
+        half = _MAX_CHARS // 2
+        text = text[:half] + "\n...[content truncated]...\n" + text[-half:]
+
+    prompt = LLM_PROMPT_STAGE1.format(text=text)
+    _ALLOWED_STATUS = {"open", "closed", "paused", "rolling", "seasonal", "unclear"}
+
+    for model in (_MODEL_FAST, _MODEL_FULL):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+                response_format={"type": "json_object"},
+                timeout=60,
+            )
+            response_text = resp.choices[0].message.content
+            data = json.loads(response_text)
+
+            raw_status = str(data.get("application_status", "") or "").strip().lower()
+            status = raw_status if raw_status in _ALLOWED_STATUS else "unclear"
+
+            result = {
+                "fund_name_extracted": (data.get("fund_name") or "").strip(),
+                "funder_name": (data.get("funder_name") or "").strip(),
+                "geographic_scope": (data.get("geographic_scope") or "").strip(),
+                "us_state_scope": data.get("us_state_scope") or [],
+                "applicant_types_list": data.get("applicant_types") or [],
+                "topic_areas": data.get("topic_areas") or [],
+                "beneficiaries_list": data.get("beneficiaries") or [],
+                "funding_range": (data.get("funding_range") or "").strip(),
+                "deadline": (data.get("deadline") or "").strip(),
+                "application_status": status,
+                "restrictions_list": data.get("restrictions") or [],
+                "grant_type": (data.get("grant_type") or "other").strip(),
+                "application_process": (data.get("application_process") or "").strip(),
+                "notes": (data.get("notes") or "").strip(),
+            }
+
+            important = ["geographic_scope", "applicant_types_list", "topic_areas", "funding_range"]
+            empty_count = sum(1 for k in important if not result.get(k))
+            if empty_count >= 3 and model == _MODEL_FAST and len(text) > 2000:
+                log_message(f"Thin Stage 1 result from {model}; retrying with {_MODEL_FULL}", "warning")
+                continue
+
+            write_fund_log_section(
+                fund_url,
+                f"STAGE 1 EXTRACTION — model={model}",
+                f"── PROMPT ──\n{prompt[:2000]}\n── RESPONSE ──\n{response_text}",
+            )
+            return result
+
+        except json.JSONDecodeError as exc:
+            log_message(f"Stage 1 JSON error ({model}): {exc}", "error")
+        except Exception as exc:
+            log_message(f"Stage 1 extraction failed ({model}): {exc}", "error")
+            break
+
+    return {
+        "fund_name_extracted": "", "funder_name": "", "geographic_scope": "",
+        "us_state_scope": [], "applicant_types_list": [], "topic_areas": [],
+        "beneficiaries_list": [], "funding_range": "", "deadline": "",
+        "application_status": "unclear", "restrictions_list": [],
+        "grant_type": "other", "application_process": "", "notes": "",
+    }
+
+
+def stage2_evaluate(
+    stage1_facts: Dict[str, Any],
+    org_profile: str,
+    geo_verdict: Dict[str, str],
+    *,
+    client: "OpenAI",
+    fund_url: str = "",
+) -> Dict[str, Any]:
+    """Stage 2: score eligibility rubric from Stage 1 facts + org profile."""
+    from utils.constants.llm import LLM_PROMPT_STAGE2, LLM_SYSTEM_PROMPT
+
+    def _join(lst) -> str:
+        if isinstance(lst, list):
+            return "; ".join(str(x) for x in lst if x) or "Not stated"
+        return str(lst or "Not stated")
+
+    geo_verdict_text = (
+        f"{geo_verdict.get('verdict', 'unknown').upper()} — {geo_verdict.get('evidence', '')}"
+    )
+
+    prompt = LLM_PROMPT_STAGE2.format(
+        org_profile=org_profile,
+        fund_name=stage1_facts.get("fund_name_extracted") or "Not stated",
+        funder_name=stage1_facts.get("funder_name") or "Not stated",
+        geographic_scope=stage1_facts.get("geographic_scope") or "Not stated",
+        geo_verdict_text=geo_verdict_text,
+        applicant_types=_join(stage1_facts.get("applicant_types_list")),
+        topic_areas=_join(stage1_facts.get("topic_areas")),
+        beneficiaries=_join(stage1_facts.get("beneficiaries_list")),
+        funding_range=stage1_facts.get("funding_range") or "Not stated",
+        application_status=stage1_facts.get("application_status") or "unclear",
+        restrictions=_join(stage1_facts.get("restrictions_list")),
+        grant_type=stage1_facts.get("grant_type") or "other",
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=_MODEL_FULL,
+            messages=[
+                {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+            timeout=60,
+        )
+        response_text = resp.choices[0].message.content
+        data = json.loads(response_text)
+
+        rubric = _normalize_rubric(data.get("rubric"))
+        evidence = (data.get("evidence") or "").strip()
+
+        write_fund_log_section(
+            fund_url,
+            f"STAGE 2 EVALUATION — model={_MODEL_FULL}",
+            f"── PROMPT ──\n{prompt[:2000]}\n── RESPONSE ──\n{response_text}",
+        )
+
+        return {
+            "match_rubric": rubric,
+            "eligibility": data.get("eligibility", "Low Match"),
+            "evidence": evidence,
+        }
+    except json.JSONDecodeError as exc:
+        log_message(f"Stage 2 JSON error: {exc}", "error")
+    except Exception as exc:
+        log_message(f"Stage 2 evaluation failed: {exc}", "error")
+
+    return {"match_rubric": {}, "eligibility": "unclear", "evidence": ""}
+
+
 def call_llm_extract(text: str, fund_url: str = "") -> Dict[str, Any]:
     """
     Extract funding information from text using a two-phase prompt.
