@@ -7,6 +7,7 @@ export default function PendingUrlsPage() {
   const [items, setItems] = useState<PendingUrlItem[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
+  const [actioning, setActioning] = useState(false);
   const [actionMsg, setActionMsg] = useState("");
 
   const load = useCallback(async () => {
@@ -36,28 +37,34 @@ export default function PendingUrlsPage() {
     );
 
   const approve = async () => {
-    if (!selected.size) return;
+    if (!selected.size || actioning) return;
+    setActioning(true);
     setActionMsg("Queuing scrape job…");
     try {
       const res = await api.adminApprovePendingUrls(Array.from(selected));
       setActionMsg(`Scrape job ${res.job_id} started for ${res.url_count} URL(s).`);
       setSelected(new Set());
-      load();
+      await load();
     } catch {
       setActionMsg("Approve failed.");
+    } finally {
+      setActioning(false);
     }
   };
 
   const reject = async () => {
-    if (!selected.size) return;
+    if (!selected.size || actioning) return;
+    setActioning(true);
     setActionMsg("Rejecting…");
     try {
       const res = await api.adminRejectPendingUrls(Array.from(selected));
       setActionMsg(`${res.rejected} URL(s) rejected.`);
       setSelected(new Set());
-      load();
+      await load();
     } catch {
       setActionMsg("Reject failed.");
+    } finally {
+      setActioning(false);
     }
   };
 
@@ -114,14 +121,18 @@ export default function PendingUrlsPage() {
                       />
                     </td>
                     <td className="px-3 py-2">
-                      <a
-                        href={item.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-blue-600 hover:underline break-all"
-                      >
-                        {item.url}
-                      </a>
+                      {/^https?:\/\//i.test(item.url) ? (
+                        <a
+                          href={item.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline break-all"
+                        >
+                          {item.url}
+                        </a>
+                      ) : (
+                        <span className="break-all text-slate-700">{item.url}</span>
+                      )}
                       {item.title && (
                         <div className="text-xs text-slate-500 mt-0.5">{item.title}</div>
                       )}
@@ -141,14 +152,14 @@ export default function PendingUrlsPage() {
           <div className="mt-4 flex gap-3">
             <button
               onClick={reject}
-              disabled={!selected.size}
+              disabled={!selected.size || actioning}
               className="rounded px-4 py-2 text-sm border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-40"
             >
               Reject selected ({selected.size})
             </button>
             <button
               onClick={approve}
-              disabled={!selected.size}
+              disabled={!selected.size || actioning}
               className="rounded px-4 py-2 text-sm bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40"
             >
               Scrape selected ({selected.size})
