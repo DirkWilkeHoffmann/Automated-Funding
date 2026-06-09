@@ -27,4 +27,9 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY . .
 
+# Install Chromium + its OS dependencies for the JS-render fallback
+# (utils/scraping.py: playwright_fetch). Without this the fallback silently
+# no-ops in production and JS-heavy funder sites fail to scrape.
+RUN playwright install --with-deps chromium
+
 CMD ["sh", "-c", "gunicorn api.main:app -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:${PORT:-8000}"]
