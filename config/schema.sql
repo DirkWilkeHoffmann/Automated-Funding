@@ -488,3 +488,36 @@ CREATE TABLE IF NOT EXISTS pending_urls (
 
 CREATE INDEX IF NOT EXISTS pending_urls_status_idx     ON pending_urls(status);
 CREATE INDEX IF NOT EXISTS pending_urls_source_url_idx ON pending_urls(source_url);
+
+-- ============================================================
+-- Phase 11 migration: Match-Quality & Targeting Engine
+-- ============================================================
+-- Mirrors config/migration_phase11_targeting_engine.sql for fresh setups.
+CREATE EXTENSION IF NOT EXISTS vector;
+
+ALTER TABLE discovery_funders ADD COLUMN IF NOT EXISTS program_areas    TEXT[];
+ALTER TABLE discovery_funders ADD COLUMN IF NOT EXISTS top_grantees     JSONB;
+ALTER TABLE discovery_funders ADD COLUMN IF NOT EXISTS grantee_purposes TEXT;
+ALTER TABLE discovery_funders ADD COLUMN IF NOT EXISTS embedding        vector(1536);
+ALTER TABLE discovery_funders ADD COLUMN IF NOT EXISTS enriched_at      TIMESTAMPTZ;
+ALTER TABLE discovery_funders ADD COLUMN IF NOT EXISTS embedded_at      TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS discovery_funders_embedding_idx
+  ON discovery_funders USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS discovery_funders_enrich_queue_idx
+  ON discovery_funders (enriched_at) WHERE enriched_at IS NULL;
+
+ALTER TABLE grant_opportunities ADD COLUMN IF NOT EXISTS embedding   vector(1536);
+ALTER TABLE grant_opportunities ADD COLUMN IF NOT EXISTS embedded_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS grant_opportunities_embedding_idx
+  ON grant_opportunities USING hnsw (embedding vector_cosine_ops);
+
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS cause_keywords       TEXT[] DEFAULT '{}';
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS targeting_confirmed  BOOLEAN DEFAULT FALSE;
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS client_embedding     vector(1536);
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS targeting_updated_at TIMESTAMPTZ;
+
+ALTER TABLE pending_urls ADD COLUMN IF NOT EXISTS funder_name      TEXT;
+ALTER TABLE pending_urls ADD COLUMN IF NOT EXISTS discovery_source TEXT;
+ALTER TABLE pending_urls ADD COLUMN IF NOT EXISTS match_score      REAL;
+ALTER TABLE pending_urls ADD COLUMN IF NOT EXISTS match_reason     TEXT;
