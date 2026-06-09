@@ -1,0 +1,34 @@
+# Python
+.venv/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets — never bake into the image
+.env
+.env.*
+frontend/.env.local
+
+# Frontend build artifacts + deps (image is backend-only)
+frontend/.next/
+frontend/out/
+frontend/node_modules/
+node_modules/
+**/*.tsbuildinfo
+
+# VCS + local tooling
+.git/
+.gitignore
+.claude/
+.swarm/
+.superpowers/
+
+# Logs, caches, generated docs/graphs
+logs/
+graphify-out/
+docs/
+
+# OS cruft
+.DS_Store
