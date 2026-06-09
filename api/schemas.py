@@ -233,6 +233,40 @@ class CategorySuggestionResponse(BaseModel):
     notes: str = ""
 
 
+# ── Phase 11: Targeting schemas ──────────────────────────────────────────────
+
+
+class TargetingDeriveRequest(BaseModel):
+    mission: str = Field(..., description="Organisation mission statement")
+    website: Optional[str] = None
+    ein: Optional[str] = None
+
+
+class TargetingSuggestion(BaseModel):
+    ntee_prefixes: List[str] = []
+    cfda_categories: List[str] = []
+    cause_keywords: List[str] = []
+    applicant_codes: List[str] = []
+    notes: str = ""
+
+
+class TargetingConfirmRequest(BaseModel):
+    ntee_prefixes: List[str] = []
+    cfda_categories: List[str] = []
+    cause_keywords: List[str] = []
+    applicant_codes: List[str] = []
+
+
+class TargetingStatusResponse(BaseModel):
+    targeting_confirmed: bool = False
+    targeting_updated_at: Optional[str] = None
+    client_embedding_set: bool = False
+    ntee_prefixes: List[str] = []
+    cfda_categories: List[str] = []
+    cause_keywords: List[str] = []
+    applicant_codes: List[str] = []
+
+
 class UserRecord(BaseModel):
     id: str
     email: Optional[str] = None

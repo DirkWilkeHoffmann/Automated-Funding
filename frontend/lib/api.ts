@@ -78,6 +78,7 @@ export const api = {
       }),
     }),
   jobStatus: (jobId: string) => request(`/scrape/jobs/${jobId}`),
+  activeJobs: () => request<{ jobs: any[] }>("/scrape/jobs"),
   cancelJob: (jobId: string) =>
     request(`/scrape/jobs/${jobId}/cancel`, { method: "POST" }),
   deleteResults: (urls: string[]) =>
@@ -198,6 +199,27 @@ export const api = {
     return request<DatasetBrowse>(`/discovery/datasets/${name}${qs ? "?" + qs : ""}`);
   },
 
+  // Phase 11: Targeting profile
+  discoveryTargetingGet: () =>
+    request<TargetingStatus>("/discovery/targeting"),
+  discoveryTargetingDerive: (payload: { mission: string; website?: string; ein?: string }) =>
+    request<TargetingSuggestion>("/discovery/targeting/derive", {
+      method: "POST",
+      body: JSON.stringify(payload),
+      timeoutMs: 60000,
+    }),
+  discoveryTargetingConfirm: (payload: {
+    ntee_prefixes: string[];
+    cfda_categories: string[];
+    cause_keywords: string[];
+    applicant_codes: string[];
+  }) =>
+    request<TargetingStatus>("/discovery/targeting", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+      timeoutMs: 60000,
+    }),
+
   // Pending URLs
   adminListPendingUrls: () =>
     request<PendingUrlItem[]>("/admin/pending-urls"),
@@ -264,6 +286,26 @@ export type DatasetBrowse = {
   total: number;
   limit: number;
   offset: number;
+};
+
+// ── Phase 11: Targeting types ─────────────────────────────────────────────────
+
+export type TargetingSuggestion = {
+  ntee_prefixes: string[];
+  cfda_categories: string[];
+  cause_keywords: string[];
+  applicant_codes: string[];
+  notes: string;
+};
+
+export type TargetingStatus = {
+  targeting_confirmed: boolean;
+  targeting_updated_at: string | null;
+  client_embedding_set: boolean;
+  ntee_prefixes: string[];
+  cfda_categories: string[];
+  cause_keywords: string[];
+  applicant_codes: string[];
 };
 
 // ── Dashboard stats shape ─────────────────────────────────────────────────────

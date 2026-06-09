@@ -23,6 +23,10 @@ from api.schemas import (
     PreFilterFunnel,
     PreFilterFunnelStage,
     PreFilterPreviewResponse,
+    TargetingConfirmRequest,
+    TargetingDeriveRequest,
+    TargetingSuggestion,
+    TargetingStatusResponse,
 )
 from utils.discovery.config_store import load_config, save_config
 from utils.discovery.progress_registry import progress_registry
@@ -645,3 +649,96 @@ def browse_dataset(
         limit=limit,
         offset=offset,
     )
+
+
+# ── Targeting profile (Phase 11) ──────────────────────────────────────────────
+
+
+def _targeting_row_to_status(row: dict) -> TargetingStatusResponse:
+    return TargetingStatusResponse(
+        targeting_confirmed=bool(row.get("targeting_confirmed", False)),
+        targeting_updated_at=row.get("targeting_updated_at"),
+        client_embedding_set=row.get("client_embedding") is not None,
+        ntee_prefixes=list(row.get("ntee_codes") or []),
+        cfda_categories=list(row.get("cfda_categories") or []),
+        cause_keywords=list(row.get("cause_keywords") or []),
+        applicant_codes=list(row.get("eligible_applicant_codes") or []),
+    )
+
+
+@router.get("/targeting", response_model=TargetingStatusResponse)
+def get_targeting(user=Depends(dependencies.require_superuser)):
+    """Return the current targeting profile state for the single org."""
+    from utils.db.client import get_supabase
+    try:
+        rows = get_supabase().table("organizations").select("*").limit(1).execute().data or []
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not rows:
+        return TargetingStatusResponse()
+    return _targeting_row_to_status(rows[0])
+
+
+@router.post("/targeting/derive", response_model=TargetingSuggestion)
+def derive_targeting_endpoint(
+    payload: TargetingDeriveRequest,
+    user=Depends(dependencies.require_superuser),
+):
+    """Ask GPT-4o to suggest NTEE/CFDA/keyword targeting from a mission. No DB write."""
+    from utils.discovery.targeting import derive_targeting
+    result = derive_targeting(
+        payload.mission,
+        website=payload.website,
+        ein=payload.ein,
+    )
+    return TargetingSuggestion(**result)
+
+
+@router.put("/targeting", response_model=TargetingStatusResponse)
+def confirm_targeting(
+    payload: TargetingConfirmRequest,
+    user=Depends(dependencies.require_superuser),
+):
+    """Persist confirmed targeting fields, compute client embedding, mark confirmed."""
+    from datetime import datetime, timezone
+    from utils.db.client import get_supabase
+    from utils.discovery.targeting import TargetingProfile, build_client_embedding
+
+    sb = get_supabase()
+    now = datetime.now(timezone.utc).isoformat()
+
+    update: dict = {
+        "ntee_codes": payload.ntee_prefixes,
+        "cfda_categories": payload.cfda_categories,
+        "cause_keywords": payload.cause_keywords,
+        "eligible_applicant_codes": payload.applicant_codes,
+        "targeting_confirmed": True,
+        "targeting_updated_at": now,
+    }
+
+    # Build + store the client embedding.
+    try:
+        rows = sb.table("organizations").select("*").limit(1).execute().data or []
+        row = rows[0] if rows else {}
+        profile = TargetingProfile.from_org_row({**row, **update})
+        vec = build_client_embedding(profile)
+        if vec is not None:
+            update["client_embedding"] = vec
+    except Exception as exc:
+        logger.warning("Could not build client embedding: %s", exc)
+
+    try:
+        rows = sb.table("organizations").select("id").limit(1).execute().data or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="No organisation record found")
+        org_id = rows[0]["id"]
+        updated = (
+            sb.table("organizations").update(update).eq("id", org_id).execute().data or []
+        )
+        row = updated[0] if updated else {**rows[0], **update}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"DB update failed: {exc}")
+
+    return _targeting_row_to_status(row)
