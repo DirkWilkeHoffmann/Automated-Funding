@@ -17,6 +17,7 @@ keys — see config_store._IMPORT_CONFIG_DEFAULTS for the defaults.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -29,6 +30,7 @@ BMF_IMPORT_JOB_ID = "bmf_import"
 IRS_990_INDEX_IMPORT_JOB_ID = "irs_990_index_import"
 GRANTS_GOV_IMPORT_JOB_ID = "grants_gov_import"
 SAM_CFDA_IMPORT_JOB_ID = "sam_cfda_import"
+FUNDER_ENRICHMENT_JOB_ID = "funder_enrichment"
 
 # Defaults — kept in sync with config_store._IMPORT_CONFIG_DEFAULTS so the
 # scheduler still boots if the config row is missing.
@@ -37,6 +39,7 @@ _DEFAULT_IRS_990_INDEX_CRON = "0 4 * * 0"
 _DEFAULT_GRANTS_GOV_CRON = "0 5 * * *"
 _DEFAULT_SAM_CFDA_CRON = "0 6 * * 0"
 _DEFAULT_DISCOVERY_CRON = "0 2 * * 1"
+_DEFAULT_FUNDER_ENRICHMENT_CRON = "0 1 * * *"  # nightly 1am UTC
 
 _scheduler: Optional[BackgroundScheduler] = None
 
@@ -105,6 +108,15 @@ def _sam_cfda_import_job() -> None:
         run_sam_cfda_import()
     except Exception as exc:
         logger.error("Scheduled SAM.gov CFDA import raised: %s", exc, exc_info=True)
+
+
+def _funder_enrichment_job() -> None:
+    """Nightly funder knowledge-base enrichment (990 parse + embed)."""
+    try:
+        from utils.discovery.funder_enrichment import run_funder_enrichment
+        run_funder_enrichment(limit=int(os.getenv("FUNDER_ENRICHMENT_BATCH", "100")))
+    except Exception as exc:
+        logger.error("Scheduled funder enrichment raised: %s", exc, exc_info=True)
 
 
 # ── Trigger building ─────────────────────────────────────────────────────────
@@ -185,6 +197,12 @@ def start_scheduler() -> None:
         _sam_cfda_import_job,
         trigger=_trigger(crons["sam_cfda"], _DEFAULT_SAM_CFDA_CRON),
         id=SAM_CFDA_IMPORT_JOB_ID,
+        replace_existing=True,
+    )
+    sched.add_job(
+        _funder_enrichment_job,
+        trigger=_trigger(_DEFAULT_FUNDER_ENRICHMENT_CRON, _DEFAULT_FUNDER_ENRICHMENT_CRON),
+        id=FUNDER_ENRICHMENT_JOB_ID,
         replace_existing=True,
     )
 
