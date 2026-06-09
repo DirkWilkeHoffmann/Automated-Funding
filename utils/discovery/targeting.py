@@ -216,6 +216,235 @@ def build_client_embedding(profile: TargetingProfile) -> Optional[List[float]]:
     return embed_text(text)
 
 
+# ── Phase 4: retrieval dataclasses + helpers ──────────────────────────────────
+
+# One-hop US state neighbours for geo broadening (level 1).
+_ADJACENT: Dict[str, List[str]] = {
+    "AL": ["FL","GA","MS","TN"],        "AK": [],
+    "AZ": ["CA","CO","NM","NV","UT"],   "AR": ["LA","MO","MS","OK","TN","TX"],
+    "CA": ["AZ","NV","OR"],              "CO": ["AZ","KS","NE","NM","OK","UT","WY"],
+    "CT": ["MA","NY","RI"],              "DE": ["MD","NJ","PA"],
+    "FL": ["AL","GA"],                   "GA": ["AL","FL","NC","SC","TN"],
+    "HI": [],                            "ID": ["MT","NV","OR","UT","WA","WY"],
+    "IL": ["IN","IA","KY","MO","WI"],   "IN": ["IL","KY","MI","OH"],
+    "IA": ["IL","MN","MO","NE","SD","WI"], "KS": ["CO","MO","NE","OK"],
+    "KY": ["IL","IN","MO","OH","TN","VA","WV"], "LA": ["AR","MS","TX"],
+    "ME": ["NH"],                        "MD": ["DE","PA","VA","WV"],
+    "MA": ["CT","NH","NY","RI","VT"],   "MI": ["IN","OH","WI"],
+    "MN": ["IA","ND","SD","WI"],        "MS": ["AL","AR","LA","TN"],
+    "MO": ["AR","IL","IA","KS","KY","NE","OK","TN"], "MT": ["ID","ND","SD","WY"],
+    "NE": ["CO","IA","KS","MO","SD","WY"], "NV": ["AZ","CA","ID","OR","UT"],
+    "NH": ["MA","ME","VT"],              "NJ": ["DE","NY","PA"],
+    "NM": ["AZ","CO","OK","TX","UT"],   "NY": ["CT","MA","NJ","PA","VT"],
+    "NC": ["GA","SC","TN","VA"],        "ND": ["MN","MT","SD"],
+    "OH": ["IN","KY","MI","PA","WV"],   "OK": ["AR","CO","KS","MO","NM","TX"],
+    "OR": ["CA","ID","NV","WA"],        "PA": ["DE","MD","NJ","NY","OH","WV"],
+    "RI": ["CT","MA"],                   "SC": ["GA","NC"],
+    "SD": ["IA","MN","MT","ND","NE","WY"], "TN": ["AL","AR","GA","KY","MO","MS","NC","VA"],
+    "TX": ["AR","LA","NM","OK"],        "UT": ["AZ","CO","ID","NV","NM","WY"],
+    "VT": ["MA","NH","NY"],              "VA": ["KY","MD","NC","TN","WV"],
+    "WA": ["ID","OR"],                   "WV": ["KY","MD","OH","PA","VA"],
+    "WI": ["IL","IA","MI","MN"],        "WY": ["CO","ID","MT","NE","SD","UT"],
+}
+
+
+@dataclass
+class TargetingCursor:
+    """Rotation state per org, persisted in discovery_state JSONB."""
+    funder_offset: int = 0
+    opp_offset: int = 0
+    geo_broaden_level: int = 0
+
+
+@dataclass
+class Candidate:
+    """A single ranked candidate from the vector search."""
+    kind: str                               # "funder" | "opportunity"
+    id: str                                 # ein or opportunity_id
+    name: str
+    url: Optional[str]
+    state: Optional[str]
+    similarity: float
+    ntee_code: Optional[str] = None
+    asset_amount: Optional[int] = None
+    program_areas: Optional[List[str]] = None
+    grantee_purposes: Optional[str] = None
+    close_date: Optional[str] = None
+    cfda_number: Optional[str] = None
+    category: Optional[str] = None
+
+
+@dataclass
+class CandidateSet:
+    funders: List[Candidate] = field(default_factory=list)
+    opportunities: List[Candidate] = field(default_factory=list)
+
+    def all_sorted(self) -> List[Candidate]:
+        return sorted(
+            self.funders + self.opportunities,
+            key=lambda c: c.similarity,
+            reverse=True,
+        )
+
+
+def _states_for_level(base: List[str], level: int) -> Optional[List[str]]:
+    """Return geo filter for the given broadening level.
+
+    0 = exact base states; 1 = base + one-hop neighbours; 2+ = no filter.
+    """
+    if not base:
+        return None
+    if level <= 0:
+        return list(base)
+    if level == 1:
+        expanded = set(base)
+        for s in base:
+            expanded.update(_ADJACENT.get(s, []))
+        return sorted(expanded)
+    return None  # level 2+ = national
+
+
+def load_cursor(profile: TargetingProfile) -> TargetingCursor:
+    """Read this org's rotation cursor from discovery_state JSONB."""
+    try:
+        from utils.discovery.config_store import load_discovery_state
+        slot = (load_discovery_state().get("targeting") or {}).get(profile.org_id) or {}
+        return TargetingCursor(
+            funder_offset=int(slot.get("funder_offset", 0)),
+            opp_offset=int(slot.get("opp_offset", 0)),
+            geo_broaden_level=int(slot.get("geo_broaden_level", 0)),
+        )
+    except Exception as exc:
+        logger.debug("load_cursor failed: %s", exc)
+        return TargetingCursor()
+
+
+def save_cursor(profile: TargetingProfile, cursor: TargetingCursor) -> None:
+    """Persist this org's rotation cursor into discovery_state JSONB."""
+    try:
+        from utils.discovery.config_store import load_discovery_state, save_discovery_state
+        state = load_discovery_state()
+        state.setdefault("targeting", {})[profile.org_id] = {
+            "funder_offset": cursor.funder_offset,
+            "opp_offset": cursor.opp_offset,
+            "geo_broaden_level": cursor.geo_broaden_level,
+        }
+        save_discovery_state(state)
+    except Exception as exc:
+        logger.warning("save_cursor failed: %s", exc)
+
+
+def retrieve_candidates(
+    profile: TargetingProfile,
+    cursor: TargetingCursor,
+    limit: int = 50,
+    *,
+    sb=None,
+) -> "tuple[CandidateSet, TargetingCursor]":
+    """Vector-search funders + opportunities ranked by mission similarity.
+
+    Implements rotation (funder_offset / opp_offset) so consecutive runs
+    surface different candidates from the same pool.  Graceful broadening:
+    if the tight geo filter yields fewer than limit//2 funders, the geo
+    filter is widened (add adjacent states → no filter) and geo_broaden_level
+    is persisted so the next run starts at the broader scope.
+
+    Returns (CandidateSet, updated_cursor). Caller must call save_cursor()
+    after the run if it wants rotation to persist.
+    """
+    if not profile.client_embedding:
+        logger.debug("retrieve_candidates: no client_embedding — skipping vector search")
+        return CandidateSet(), TargetingCursor(
+            funder_offset=cursor.funder_offset,
+            opp_offset=cursor.opp_offset,
+            geo_broaden_level=cursor.geo_broaden_level,
+        )
+
+    if sb is None:
+        from utils.db.client import get_supabase
+        sb = get_supabase()
+
+    vec = profile.client_embedding
+    base_states = profile.effective_states()
+    funder_limit = max(limit * 3 // 4, 1)
+    opp_limit = max(limit - funder_limit, 1)
+
+    # ── Funder search with broadening ─────────────────────────────────────
+    funder_rows: List[Dict[str, Any]] = []
+    final_level = cursor.geo_broaden_level
+
+    for level in range(cursor.geo_broaden_level, 3):
+        states = _states_for_level(base_states, level)
+        params: Dict[str, Any] = {
+            "query_embedding": vec,
+            "match_count": funder_limit,
+            "funder_offset": cursor.funder_offset,
+            "min_asset_code": 1,
+        }
+        if states:
+            params["filter_states"] = states
+        try:
+            funder_rows = sb.rpc("match_funders", params).execute().data or []
+        except Exception as exc:
+            logger.warning("match_funders RPC failed (level=%d): %s", level, exc)
+            funder_rows = []
+        final_level = level
+        if len(funder_rows) >= limit // 2:
+            break
+
+    # ── Opportunity search ─────────────────────────────────────────────────
+    opp_rows: List[Dict[str, Any]] = []
+    try:
+        opp_rows = (
+            sb.rpc("match_opportunities", {
+                "query_embedding": vec,
+                "match_count": opp_limit,
+                "opp_offset": cursor.opp_offset,
+            }).execute().data or []
+        )
+    except Exception as exc:
+        logger.warning("match_opportunities RPC failed: %s", exc)
+
+    # ── Build candidate objects ────────────────────────────────────────────
+    funders = [
+        Candidate(
+            kind="funder",
+            id=str(r.get("ein") or ""),
+            name=str(r.get("name") or ""),
+            url=r.get("website"),
+            state=r.get("state"),
+            similarity=float(r.get("similarity") or 0.0),
+            ntee_code=r.get("ntee_code"),
+            asset_amount=r.get("asset_amount"),
+            program_areas=r.get("program_areas"),
+            grantee_purposes=r.get("grantee_purposes"),
+        )
+        for r in funder_rows
+    ]
+    opportunities = [
+        Candidate(
+            kind="opportunity",
+            id=str(r.get("opportunity_id") or ""),
+            name=str(r.get("title") or ""),
+            url=r.get("url"),
+            state=None,
+            similarity=float(r.get("similarity") or 0.0),
+            close_date=r.get("close_date"),
+            cfda_number=r.get("cfda_number"),
+            category=r.get("category"),
+        )
+        for r in opp_rows
+    ]
+
+    # ── Advance rotation cursors (reset to 0 when pool exhausted) ─────────
+    new_cursor = TargetingCursor(
+        funder_offset=cursor.funder_offset + len(funder_rows) if funder_rows else 0,
+        opp_offset=cursor.opp_offset + len(opp_rows) if opp_rows else 0,
+        geo_broaden_level=final_level,
+    )
+    return CandidateSet(funders=funders, opportunities=opportunities), new_cursor
+
+
 def load_targeting_profile() -> TargetingProfile:
     """Load targeting profile from the single org row. Falls back to empty profile."""
     try:
