@@ -32,6 +32,7 @@ _IMPORT_CONFIG_DEFAULTS: Dict[str, Any] = {
 
 _DEFAULTS: Dict[str, Any] = {
     "enabled": False,
+    "targeting_enabled": False,  # Phase 7: demand-driven targeting path (default off)
     "cron_expression": "0 2 * * 1",  # Monday 2am UTC
     "states": [],
     "keywords": [],
@@ -74,6 +75,7 @@ def _load_config_cached() -> Dict[str, Any]:
             return {
                 "id": row.get("id"),
                 "enabled": bool(row.get("enabled", False)),
+                "targeting_enabled": bool(row.get("targeting_enabled", False)),
                 "cron_expression": row.get("cron_expression") or _DEFAULTS["cron_expression"],
                 "states": row.get("states") or [],
                 "keywords": row.get("keywords") or [],
@@ -196,6 +198,7 @@ def save_config(data: Dict[str, Any]) -> Dict[str, Any]:
 
     payload = {
         "enabled": bool(data.get("enabled", False)),
+        "targeting_enabled": bool(data.get("targeting_enabled", False)),
         "cron_expression": data.get("cron_expression") or _DEFAULTS["cron_expression"],
         "states": data.get("states") or [],
         "keywords": data.get("keywords") or [],

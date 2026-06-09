@@ -342,111 +342,121 @@ def run_discovery(*, trigger: str = "scheduled", run_id: str | None = None) -> s
 
     try:
         discovery_state = load_discovery_state()
-        sources = _build_enabled_sources(config)
-        keywords = _derive_keywords(config)
-        effective_states = _get_effective_states(config)
-
-        # Seed pending source slots so the UI shows the full grid from t=0
-        for s in sources:
-            progress.ensure_source(s.name)
-        throttle.maybe_write(progress, force=True)
-
-        max_workers = max(1, len(sources))
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="disc") as pool:
-            futures = {
-                pool.submit(
-                    _run_source,
-                    s,
-                    config,
-                    discovery_state.get(s.name, {}),
-                    progress,
-                    throttle,
-                    keywords,
-                    effective_states,
-                ): s.name
-                for s in sources
-            }
-            for fut in as_completed(futures):
-                src_name = futures[fut]
-                try:
-                    name, collected, docs, src_state = fut.result()
-                    new_state[name] = src_state
-                    for url, source_name, funder_name in collected:
-                        if url and url not in url_to_source:
-                            url_to_source[url] = source_name
-                            if funder_name:
-                                url_to_funder[url] = funder_name
-                    all_documents.extend(docs)
-                except Exception as exc:
-                    logger.error("Source %s failed at top level: %s", src_name, exc, exc_info=True)
-                    progress.update_source(src_name, status="failed", error=str(exc))
-
-        all_discovered = list(url_to_source.keys())
-        progress.urls_discovered = len(all_discovered)
-        logger.info("Discovery found %d total URLs, %d documents", len(all_discovered), len(all_documents))
-        throttle.maybe_write(progress, force=True)
-
-        # Document fetching + LLM extraction (Phase 2)
-        if all_documents and not progress.cancel_token.is_set():
-            progress.status = "running_docs"
-            doc_cap = int(config.get("documents_per_run") or DOCUMENTS_PER_RUN_DEFAULT)
-            throttle.maybe_write(progress, force=True)
-
-            def _doc_progress(update: Dict[str, Any]) -> None:
-                # Lightweight per-document tick; orchestrator updates aggregates below
-                pass
-
-            doc_stats = fetch_documents(
-                all_documents,
-                cancel_token=progress.cancel_token,
-                per_run_cap=doc_cap,
-                progress_cb=_doc_progress,
+        if config.get("targeting_enabled"):
+            from utils.discovery.targeted_run import run_targeted_path
+            new_urls, _pending, _dropped, targeting_state, scrape_job_id = run_targeted_path(
+                config, progress, throttle, discovery_state,
             )
-            progress.documents_submitted = doc_stats["submitted"]
-            progress.documents_downloaded = doc_stats["downloaded"]
-            progress.documents_extracted = doc_stats["extracted"]
-            progress.documents_skipped_dedup = doc_stats["skipped_dedup"]
-            progress.documents_errors = doc_stats["errors"]
-            progress.status = "running"
-            throttle.maybe_write(progress, force=True)
-
-        if progress.cancel_token.is_set():
-            failure = "cancelled"
-        else:
-            processed = get_processed_urls(force_refresh=True)
-            new_urls = [u for u in all_discovered if normalize_url(u) not in processed]
-            progress.urls_new = len(new_urls)
-            logger.info("Discovery: %d new (unprocessed) URLs after dedup", len(new_urls))
-
-            # Update per-source new-URL counts after global dedup
-            per_source_new: Dict[str, int] = {}
-            for u in new_urls:
-                src = url_to_source.get(u, "")
-                if src:
-                    per_source_new[src] = per_source_new.get(src, 0) + 1
-            for src_name, count in per_source_new.items():
-                progress.update_source(src_name, urls_new=count)
-            for u in new_urls[:50]:
-                progress.add_result_preview({
-                    "url": u,
-                    "funder_name": url_to_funder.get(u, ""),
-                    "source": url_to_source.get(u, ""),
-                }, cap=50)
-            throttle.maybe_write(progress, force=True)
-
-            if new_urls:
-                url_metadata = {
-                    u: {
-                        "discovery_source": url_to_source.get(u, "auto"),
-                        **({"fund_name": url_to_funder[u]} if url_to_funder.get(u) else {}),
-                    }
-                    for u in new_urls
-                }
-                from api.jobs import job_store
-                job = job_store.create(new_urls, url_metadata=url_metadata)
-                scrape_job_id = job.id
+            all_discovered = new_urls
+            new_state.update(targeting_state)
+            if scrape_job_id:
                 progress.scrape_job_id = scrape_job_id
-                logger.info("Discovery spawned scrape job %s for %d URLs", scrape_job_id, len(new_urls))
+        else:
+            sources = _build_enabled_sources(config)
+            keywords = _derive_keywords(config)
+            effective_states = _get_effective_states(config)
+
+            # Seed pending source slots so the UI shows the full grid from t=0
+            for s in sources:
+                progress.ensure_source(s.name)
+            throttle.maybe_write(progress, force=True)
+
+            max_workers = max(1, len(sources))
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="disc") as pool:
+                futures = {
+                    pool.submit(
+                        _run_source,
+                        s,
+                        config,
+                        discovery_state.get(s.name, {}),
+                        progress,
+                        throttle,
+                        keywords,
+                        effective_states,
+                    ): s.name
+                    for s in sources
+                }
+                for fut in as_completed(futures):
+                    src_name = futures[fut]
+                    try:
+                        name, collected, docs, src_state = fut.result()
+                        new_state[name] = src_state
+                        for url, source_name, funder_name in collected:
+                            if url and url not in url_to_source:
+                                url_to_source[url] = source_name
+                                if funder_name:
+                                    url_to_funder[url] = funder_name
+                        all_documents.extend(docs)
+                    except Exception as exc:
+                        logger.error("Source %s failed at top level: %s", src_name, exc, exc_info=True)
+                        progress.update_source(src_name, status="failed", error=str(exc))
+
+            all_discovered = list(url_to_source.keys())
+            progress.urls_discovered = len(all_discovered)
+            logger.info("Discovery found %d total URLs, %d documents", len(all_discovered), len(all_documents))
+            throttle.maybe_write(progress, force=True)
+
+            # Document fetching + LLM extraction (Phase 2)
+            if all_documents and not progress.cancel_token.is_set():
+                progress.status = "running_docs"
+                doc_cap = int(config.get("documents_per_run") or DOCUMENTS_PER_RUN_DEFAULT)
+                throttle.maybe_write(progress, force=True)
+
+                def _doc_progress(update: Dict[str, Any]) -> None:
+                    # Lightweight per-document tick; orchestrator updates aggregates below
+                    pass
+
+                doc_stats = fetch_documents(
+                    all_documents,
+                    cancel_token=progress.cancel_token,
+                    per_run_cap=doc_cap,
+                    progress_cb=_doc_progress,
+                )
+                progress.documents_submitted = doc_stats["submitted"]
+                progress.documents_downloaded = doc_stats["downloaded"]
+                progress.documents_extracted = doc_stats["extracted"]
+                progress.documents_skipped_dedup = doc_stats["skipped_dedup"]
+                progress.documents_errors = doc_stats["errors"]
+                progress.status = "running"
+                throttle.maybe_write(progress, force=True)
+
+            if progress.cancel_token.is_set():
+                failure = "cancelled"
+            else:
+                processed = get_processed_urls(force_refresh=True)
+                new_urls = [u for u in all_discovered if normalize_url(u) not in processed]
+                progress.urls_new = len(new_urls)
+                logger.info("Discovery: %d new (unprocessed) URLs after dedup", len(new_urls))
+
+                # Update per-source new-URL counts after global dedup
+                per_source_new: Dict[str, int] = {}
+                for u in new_urls:
+                    src = url_to_source.get(u, "")
+                    if src:
+                        per_source_new[src] = per_source_new.get(src, 0) + 1
+                for src_name, count in per_source_new.items():
+                    progress.update_source(src_name, urls_new=count)
+                for u in new_urls[:50]:
+                    progress.add_result_preview({
+                        "url": u,
+                        "funder_name": url_to_funder.get(u, ""),
+                        "source": url_to_source.get(u, ""),
+                    }, cap=50)
+                throttle.maybe_write(progress, force=True)
+
+                if new_urls:
+                    url_metadata = {
+                        u: {
+                            "discovery_source": url_to_source.get(u, "auto"),
+                            **({"fund_name": url_to_funder[u]} if url_to_funder.get(u) else {}),
+                        }
+                        for u in new_urls
+                    }
+                    from api.jobs import job_store
+                    job = job_store.create(new_urls, url_metadata=url_metadata)
+                    scrape_job_id = job.id
+                    progress.scrape_job_id = scrape_job_id
+                    logger.info("Discovery spawned scrape job %s for %d URLs", scrape_job_id, len(new_urls))
 
     except Exception as exc:
         logger.error("Discovery run %s failed: %s", run_id, exc, exc_info=True)
