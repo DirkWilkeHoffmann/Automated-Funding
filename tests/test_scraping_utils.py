@@ -42,3 +42,11 @@ def test_word_count_basic():
 
 def test_word_count_extra_spaces():
     assert _word_count("  hello   world  ") == 2
+
+
+def test_playwright_semaphore_exists_and_bounds_concurrency():
+    import utils.scraping as scraping
+    # A module-level bounded semaphore must gate browser launches.
+    assert hasattr(scraping, "_PW_SEM")
+    # Default cap is 1 on the constrained container.
+    assert scraping._PW_SEM._initial_value == 1

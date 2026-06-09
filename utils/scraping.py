@@ -3,8 +3,10 @@
 import io
 import ipaddress
 import logging
+import os
 import re
 import socket
+import threading
 import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
@@ -50,6 +52,10 @@ _GRANT_PATH_KEYWORDS = frozenset({
 
 _PLAYWRIGHT_WORD_THRESHOLD = 150
 
+# Cap concurrent headless-Chromium instances. The Azure Container App is
+# 0.5 vCPU / 1 GiB — uncapped Chromium across the discovery thread-pool OOMs.
+_PW_SEM = threading.BoundedSemaphore(int(os.getenv("PLAYWRIGHT_MAX_CONCURRENCY", "1")))
+
 
 def _is_junk_url(url: str) -> bool:
     """Return True for comment pages, social share variants, and tracking URLs."""
@@ -74,13 +80,14 @@ def playwright_fetch(url: str) -> Optional[str]:
         log_message("playwright not installed — skipping JS render fallback", "warning")
         return None
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            content = page.content()
-            browser.close()
-            return content
+        with _PW_SEM:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(url, wait_until="networkidle", timeout=30000)
+                content = page.content()
+                browser.close()
+                return content
     except Exception as exc:
         log_message(f"Playwright fetch failed for {url}: {exc}", "warning")
         return None
