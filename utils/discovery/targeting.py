@@ -272,7 +272,10 @@ class Candidate:
     close_date: Optional[str] = None
     cfda_number: Optional[str] = None
     category: Optional[str] = None
-    match_score: float = 0.0  # set by scoring.rank_candidates (Phase 5)
+    match_score: float = 0.0         # set by scoring.rank_candidates (Phase 5)
+    match_reason: str = ""           # set by rerank.rerank_and_explain (Phase 6)
+    past_grantee_overlap: bool = False
+    predicted_tier: str = ""         # "highly_eligible"|"eligible"|"borderline"|"not_eligible"
 
 
 @dataclass

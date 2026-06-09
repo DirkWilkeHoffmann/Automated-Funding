@@ -34,7 +34,10 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from utils.scraping import fetch_page
+from utils.llm_utils import _MODEL_FAST
+from utils.scraping import fetch_page, playwright_fetch
+
+_THIN_CONTENT_WORDS = 50  # below this word count → try Playwright render
 
 logger = logging.getLogger(__name__)
 
@@ -255,21 +258,44 @@ def find_grants_page(
     """Find the most likely grant-application page on a foundation website.
 
     Returns (url, reason) on success, None when no candidate page is found.
-    `reason` is one of: "keyword_match", "llm_classifier".
+    `reason` is one of: "sitemap", "keyword_match", "llm_classifier".
 
     Strategy:
-      1. Fetch homepage. If fetch fails → None.
-      2. Phase A: keyword-score all internal links, return top 3 if any score
-         above threshold.
-      3. Phase B (optional): if Phase A returns nothing, ask gpt-4o-mini.
-      4. None when both phases come up empty.
+      0. Sitemap map: if /robots.txt or /sitemap.xml reveals grant-intent URLs,
+         return the top-ranked one immediately (no page fetch needed).
+      1. Fetch homepage via HTTP. If too thin (JS-heavy site), retry with
+         Playwright (capped semaphore — safe on the 1 GiB container).
+      2. Phase A: keyword-score all internal links; return best if above threshold.
+      3. Phase B (optional): LLM classifier on the link list.
+      4. None when all phases come up empty.
 
-    Cost: 1 HTTP fetch always. 1 LLM call only when Phase A finds nothing.
+    Cost: sitemap check = 1–2 HTTP fetches. If that fails: 1 page fetch +
+    optionally 1 Playwright render + optionally 1 LLM call.
     """
+    # Phase 0 — sitemap map (cheapest; no page parse needed)
+    try:
+        from utils.discovery.sitemap_map import find_funding_urls
+        sitemap_hits = find_funding_urls(homepage_url)
+        if sitemap_hits:
+            return sitemap_hits[0], "sitemap"
+    except Exception as exc:
+        logger.debug("sitemap_map failed for %s: %s", homepage_url, exc)
+
+    # Phase 1 — HTTP fetch (with Playwright fallback for thin content)
     html = fetch_page(homepage_url)
     if not html:
         logger.info("foundation_crawler: could not fetch %s", homepage_url)
         return None
+
+    word_count = len(html.split())
+    if word_count < _THIN_CONTENT_WORDS:
+        logger.debug(
+            "foundation_crawler: thin content (%d words) for %s — trying Playwright",
+            word_count, homepage_url,
+        )
+        rendered = playwright_fetch(homepage_url)
+        if rendered:
+            html = rendered
 
     links = _extract_links(html, homepage_url)
     if not links:

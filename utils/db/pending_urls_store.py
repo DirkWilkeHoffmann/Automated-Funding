@@ -41,6 +41,44 @@ def upsert_pending_urls(items: List[dict], source_url: str) -> int:
         return 0
 
 
+def upsert_targeting_pending(candidates: list) -> int:
+    """Insert targeting-pipeline candidates into pending_urls with enriched metadata.
+
+    Accepts a list of Candidate objects (duck-typed) that have already passed
+    the relevance gate with Lane.PENDING. Writes url, title, funder_name,
+    discovery_source, match_score, match_reason in addition to the base fields.
+    Duplicates are silently ignored (on_conflict="url").
+    Returns the number of rows attempted.
+    """
+    if not candidates:
+        return 0
+    rows = []
+    for c in candidates:
+        url = getattr(c, "url", None)
+        if not url:
+            continue
+        rows.append({
+            "url": url,
+            "title": (getattr(c, "name", None) or "")[:240],
+            "source_url": url,
+            "status": "awaiting_review",
+            "funder_name": (getattr(c, "name", None) or "")[:240],
+            "discovery_source": "targeting_engine",
+            "match_score": float(getattr(c, "match_score", 0.0) or 0.0),
+            "match_reason": (getattr(c, "match_reason", None) or "")[:500],
+        })
+    if not rows:
+        return 0
+    try:
+        get_supabase().table("pending_urls").upsert(
+            rows, on_conflict="url", ignore_duplicates=True
+        ).execute()
+        return len(rows)
+    except Exception as exc:
+        logger.warning("upsert_targeting_pending failed: %s", exc)
+        return 0
+
+
 def list_pending(status: str = "awaiting_review") -> List[dict]:
     """Return pending_urls rows with the given status, newest first."""
     try:

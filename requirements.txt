@@ -13,6 +13,7 @@ charset-normalizer==3.4.4
 click==8.3.0
 colorama==0.4.6
 cryptography==46.0.3
+defusedxml==0.7.1
 distro==1.9.0
 fastapi==0.124.2
 gitdb==4.0.12
