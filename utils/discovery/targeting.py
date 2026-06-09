@@ -272,6 +272,7 @@ class Candidate:
     close_date: Optional[str] = None
     cfda_number: Optional[str] = None
     category: Optional[str] = None
+    match_score: float = 0.0  # set by scoring.rank_candidates (Phase 5)
 
 
 @dataclass
