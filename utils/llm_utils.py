@@ -379,6 +379,15 @@ def call_llm_extract(text: str, fund_url: str = "") -> Dict[str, Any]:
                 phase2=phase2,
             )
 
+    # ── Deterministic deadline → closed override ──────────────────────────
+    # If the extracted deadline date is in the past, force status to "closed"
+    # regardless of what the LLM scraped from the page.
+    _dl_str = (s1.get("deadline") or "").strip()
+    _dl_parsed = _parse_deadline_date(_dl_str)
+    if _dl_parsed and _dl_parsed.date() < datetime.now().date():
+        s1["application_status"] = "closed"
+        log_message(f"Deadline '{_dl_str}' is past — overriding status to 'closed' for {fund_url}", "info")
+
     # ── Flatten Stage 1 lists → semicolon strings (existing DB schema) ────
     def _join_list(v) -> str:
         if isinstance(v, list):
@@ -894,12 +903,37 @@ def _tier_from_rubric(rubric: Dict[str, Dict[str, str]]) -> str:
     mismatch_count = sum(1 for v in verdicts.values() if v == "mismatch")  # non-veto only at this point
 
     if mismatch_count == 0 and match_count >= 6:
-        return "Highly Eligible"
-    if mismatch_count <= 1 and match_count >= 3:
-        return "Eligible"
-    if match_count == 2:
-        return "Possibly Eligible"
-    return "Low Match"
+        tier = "Highly Eligible"
+    elif mismatch_count <= 1 and match_count >= 3:
+        tier = "Eligible"
+    elif match_count == 2:
+        tier = "Possibly Eligible"
+    else:
+        tier = "Low Match"
+
+    # Safety net: if the fund's topic is only a partial match (not a clear domain overlap),
+    # cap at "Possibly Eligible" regardless of how well other dimensions score.
+    # Prevents "Eligible" from being awarded to off-domain funds (fire management,
+    # maritime heritage, housing rehab, etc.) that incidentally mention training/education.
+    if verdicts.get("topic_focus") == "partial" and tier in ("Highly Eligible", "Eligible"):
+        tier = "Possibly Eligible"
+
+    return tier
+
+
+def _parse_deadline_date(deadline_str: str) -> Optional[datetime]:
+    """Parse a human-readable deadline string into a datetime, or None if unparseable."""
+    if not deadline_str:
+        return None
+    s = deadline_str.strip()
+    _SKIP = {"not stated", "rolling", "ongoing", "n/a", "tbd", "to be determined", ""}
+    if s.lower() in _SKIP:
+        return None
+    try:
+        from dateutil import parser as _dateutil
+        return _dateutil.parse(s, default=datetime(datetime.now().year, 1, 1))
+    except Exception:
+        return None
 
 
 def _is_thin_result(result: Dict[str, Any]) -> bool:

@@ -521,3 +521,6 @@ ALTER TABLE pending_urls ADD COLUMN IF NOT EXISTS funder_name      TEXT;
 ALTER TABLE pending_urls ADD COLUMN IF NOT EXISTS discovery_source TEXT;
 ALTER TABLE pending_urls ADD COLUMN IF NOT EXISTS match_score      REAL;
 ALTER TABLE pending_urls ADD COLUMN IF NOT EXISTS match_reason     TEXT;
+
+-- Phase 7: targeting_enabled flag on discovery_config
+ALTER TABLE discovery_config ADD COLUMN IF NOT EXISTS targeting_enabled BOOLEAN DEFAULT FALSE;

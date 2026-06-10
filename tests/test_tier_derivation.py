@@ -78,6 +78,24 @@ def test_veto_applicant_type_not_eligible():
     assert _tier_from_rubric(rubric) == "Not Eligible"
 
 
+def test_veto_topic_focus_not_eligible():
+    rubric = _rubric({
+        "geography": "match", "applicant_type": "match",
+        "org_history": "match", "grant_size": "match", "cost_share": "match",
+        "topic_focus": "mismatch",
+    })
+    assert _tier_from_rubric(rubric) == "Not Eligible"
+
+
+def test_veto_beneficiary_not_eligible():
+    rubric = _rubric({
+        "geography": "match", "applicant_type": "match", "topic_focus": "match",
+        "org_history": "match", "grant_size": "match", "cost_share": "match",
+        "beneficiary": "mismatch",
+    })
+    assert _tier_from_rubric(rubric) == "Not Eligible"
+
+
 def test_veto_org_history_not_eligible():
     assert _tier_from_rubric(_rubric({"org_history": "mismatch"})) == "Not Eligible"
 
@@ -97,3 +115,24 @@ def test_empty_rubric_low_match():
 def test_partial_verdicts_not_eligible_threshold():
     rubric = _rubric({d: "partial" for d in _DIMS})
     assert _tier_from_rubric(rubric) == "Low Match"
+
+
+def test_partial_topic_focus_caps_eligible_to_possibly():
+    """Off-domain funds with many other matches must not exceed 'Possibly Eligible'."""
+    rubric = _rubric({
+        "geography": "match", "applicant_type": "match",
+        "topic_focus": "partial",   # e.g. fire management that mentions 'training'
+        "beneficiary": "match", "org_history": "match", "grant_size": "match",
+    })
+    assert _tier_from_rubric(rubric) == "Possibly Eligible"
+
+
+def test_partial_topic_focus_caps_highly_eligible_to_possibly():
+    rubric = _rubric({d: "match" for d in _DIMS if d != "topic_focus"} | {"topic_focus": "partial"})
+    assert _tier_from_rubric(rubric) == "Possibly Eligible"
+
+
+def test_match_topic_focus_allows_eligible():
+    """Full topic match should still produce 'Eligible' normally."""
+    rubric = _rubric({"geography": "match", "applicant_type": "match", "topic_focus": "match"})
+    assert _tier_from_rubric(rubric) == "Eligible"

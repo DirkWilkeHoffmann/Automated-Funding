@@ -14,8 +14,8 @@ ELIGIBILITY_ORDER = [
 RUBRIC_DIMENSIONS = [
     "geography",         # VETO — fund's geo scope ∩ org's countries+regions
     "applicant_type",    # VETO — fund's accepted types ∩ org's legal status
-    "topic_focus",       # non-veto — fund's focus areas ∩ org's mission
-    "beneficiary",       # non-veto — fund's intended beneficiaries ∩ org's beneficiaries
+    "topic_focus",       # VETO — fund's primary domain must overlap with org's mission
+    "beneficiary",       # VETO — fund's required population must overlap with org's served population
     "org_history",       # VETO — minimum-years requirement vs org's founding year
     "grant_size",        # non-veto — fund's range vs org's needed range
     "cost_share",        # VETO — matching-fund requirement vs org's capability
@@ -23,7 +23,7 @@ RUBRIC_DIMENSIONS = [
 ]
 
 VETO_DIMENSIONS = {
-    "geography", "applicant_type", "org_history", "cost_share", "explicit_exclusion",
+    "geography", "applicant_type", "topic_focus", "beneficiary", "org_history", "cost_share", "explicit_exclusion",
 }
 
 RUBRIC_VERDICTS = {"match", "partial", "mismatch", "unknown"}
@@ -36,7 +36,12 @@ LLM_SYSTEM_PROMPT = (
     "(2) For private or community foundation websites: use stated grantmaking focus areas, geographic language, and PAST GRANTEE EXAMPLES to infer eligibility. Past grantees are first-class evidence — if the funder has supported orgs with overlapping mission and applicant type, that proves the funder accepts orgs like yours; quote one or two grantee names in your evidence. "
     "(3) EXTRACTION RULE — ALWAYS extract every field that is present in the source text, regardless of grant type. Actively SEARCH the text for: deadline dates (look for 'Deadline:', 'Closes:', 'Apply by:', 'Due date:', 'Submission deadline:', specific dates), funding ranges (look for currency symbols, 'up to', 'awards of', 'grant size'), application status (open/closed/rolling), contact info. Extraction is INDEPENDENT of rating. Only emit 'Not stated' when the field genuinely does not appear anywhere in the text. "
     "(4) RUBRIC RULE — score 7 of the 8 rubric dimensions yourself: applicant_type, topic_focus, beneficiary, org_history, grant_size, cost_share, explicit_exclusion. Use verdict ∈ {match, partial, mismatch, unknown} with a one-sentence evidence quote. Be honest — `unknown` is correct when the fund text doesn't state the requirement. "
-    "(5) VETO RULE — four veto dimensions for you to score: applicant_type, org_history, cost_share, explicit_exclusion. A `mismatch` on ANY of these means 'Not Eligible'. "
+    "(5) VETO RULE — six veto dimensions for you to score: applicant_type, topic_focus, beneficiary, org_history, cost_share, explicit_exclusion. A `mismatch` on ANY of these means 'Not Eligible'. "
+    "topic_focus scoring — the PRIMARY domain of the fund must be workforce development, employment, or economic mobility for this org: "
+    "`mismatch` when the fund's PRIMARY subject belongs to a different field — heritage/culture/maritime, fire/disaster management, housing/homeownership rehab, healthcare/medical, arts, conservation/environment, agriculture, infrastructure. IMPORTANT: a fund that incidentally mentions 'education', 'training', or 'local employment' within an otherwise unrelated program (e.g. fire safety training, maritime heritage education, housing counseling) does NOT qualify as topic overlap — score `mismatch`. "
+    "`partial` ONLY when the fund explicitly names workforce development, job placement, vocational training, or economic mobility as a CENTRAL (not peripheral) program element — e.g. a community development fund whose stated purposes include 'job training and workforce readiness programs'. "
+    "`match` when workforce development, employment services, or economic opportunity for working-age adults is the fund's primary or stated purpose. "
+    "beneficiary scoring: `mismatch` when the fund's required population is incompatible with the org's (e.g. maritime heritage audiences, fire-prone homeowners, housing rehab recipients, children with disabilities vs. unemployed adults). Use `partial` when populations meaningfully overlap (e.g. fund targets 'low-income adults' broadly). "
     "(6) GEOGRAPHY — always emit `\"verdict\": \"unknown\"` for the geography rubric dimension. Geography is computed programmatically by the system from the geographic_scope you extract — your verdict is ignored and overridden. Focus instead on extracting the geographic_scope text accurately and completely (include province/region names AND the country name). "
     "(7) Quote or closely paraphrase phrases from the source text (including any 990 data) as evidence. "
     "(8) Always give a clear, actionable recommendation. Be country-agnostic — the org may operate in any combination of countries, and that is fully valid. "
@@ -114,7 +119,9 @@ Grant type: {grant_type}
 "Possibly Eligible" — No veto mismatch AND 2 match.
 "Low Match"         — No veto mismatch, fewer than 2 match.
 "Not Eligible"      — ANY veto dimension is `mismatch`.
-Veto dimensions: geography, applicant_type, org_history, cost_share, explicit_exclusion.
+Veto dimensions: geography, applicant_type, topic_focus, beneficiary, org_history, cost_share, explicit_exclusion.
+Note on topic_focus: `mismatch` when the fund's PRIMARY domain is NOT workforce development — heritage/culture, fire/disaster management, housing rehab, healthcare, arts, conservation, agriculture. A fund that incidentally mentions 'training', 'education', or 'local employment' within an otherwise unrelated program (fire safety training, maritime education, housing counseling) is NOT a match — score `mismatch`. Use `partial` ONLY when the fund explicitly names job training, workforce development, or economic mobility as a CENTRAL program element. Use `match` when the fund's primary purpose is employment or economic opportunity.
+Note on beneficiary: `mismatch` when the fund's REQUIRED population is incompatible with the org's (maritime heritage audiences, fire-prone homeowners, housing rehab recipients vs. unemployed adults). Use `partial` when populations meaningfully overlap (e.g. 'low-income adults broadly').
 
 Score EXACTLY 7 rubric dimensions. Geography verdict is pre-computed above — emit it verbatim.
 
@@ -154,7 +161,7 @@ LLM_PROMPT = """Evaluate the funding opportunity below against the organisation 
 "Eligible"          — All veto dimensions match AND ≥3 of 8 total match. Worth pursuing with standard effort.
 "Possibly Eligible" — All veto dimensions match AND only 2 of 8 match (rest partial/unknown). Worth verifying before investing time.
 "Low Match"         — No veto mismatch, but fewer than 2 dimensions match. Topical fit is weak.
-"Not Eligible"      — ANY veto dimension (geography, applicant_type, org_history, cost_share, explicit_exclusion) is `mismatch`.
+"Not Eligible"      — ANY veto dimension (geography, applicant_type, topic_focus, beneficiary, org_history, cost_share, explicit_exclusion) is `mismatch`.
 
 IMPORTANT — extraction vs. rubric (two SEPARATE concerns):
 
@@ -220,7 +227,9 @@ Return ONLY a valid JSON object. ALL 13 fields are required.
 
 Rules for the rubric:
 - geography verdict MUST always be "unknown" — system overrides it.
-- VETO (your 4 veto dimensions): if ANY of applicant_type, org_history, cost_share, explicit_exclusion is `mismatch` → eligibility MUST be "Not Eligible".
+- VETO (your 6 veto dimensions): if ANY of applicant_type, topic_focus, beneficiary, org_history, cost_share, explicit_exclusion is `mismatch` → eligibility MUST be "Not Eligible".
+- topic_focus: `mismatch` when the fund's PRIMARY domain is NOT workforce development — this includes heritage/maritime/culture, fire/disaster management, housing/homeownership rehab, healthcare, arts, conservation, agriculture, infrastructure. A fund that incidentally mentions 'education', 'training', or 'employment' within a program about fire safety, maritime history, or housing rehab is NOT a topic match — score `mismatch`. Use `partial` ONLY when workforce development, job placement, or vocational training is an explicit named program element (not a side-effect). Use `match` when the fund's primary purpose is workforce development, employment, or economic opportunity.
+- beneficiary: `mismatch` when the fund's REQUIRED beneficiary population is incompatible with the org's (e.g. maritime heritage audiences, fire-prone homeowners, housing rehab recipients vs. unemployed adults seeking employment). Use `partial` when populations meaningfully overlap (e.g. 'low-income adults broadly').
 - `unknown` is correct when the fund text doesn't state the requirement. Never guess.
 - Quote source text in evidence when possible.
 

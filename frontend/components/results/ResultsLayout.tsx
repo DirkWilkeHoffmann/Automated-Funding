@@ -10,6 +10,7 @@ import { ResultsHeader } from "./ResultsHeader";
 import { ResultsToolbar } from "./ResultsToolbar";
 import { ResultsFilters } from "./ResultsFilters";
 import { ResultsTable, getRowKey } from "./ResultsTable";
+import { ScrapeQueueBanner } from "./ScrapeQueueBanner";
 
 type ResultRecord = Record<string, any>;
 
@@ -30,6 +31,8 @@ const RESULTS_CACHE_KEY = "results_cache_v4";
 const RESULTS_FORCE_REFRESH_KEY = "results_force_refresh_v1";
 const STARRED_KEY = "results_starred_v1";
 const ARCHIVED_KEY = "results_archived_v1";
+// Persists new-row keys with their first-seen timestamp. Expires after 24h.
+const NEW_KEYS_STORAGE = "results_new_keys_v2";
 
 const eligibilityFilterOptions = [
   "Highly Eligible",
@@ -235,6 +238,7 @@ export function ResultsLayout() {
   const [rescraping, setRescraping] = useState(false);
   const seenUrls = useRef<Set<string>>(new Set());
   const searchRef = useRef<HTMLInputElement>(null);
+  const lastCheckedUrlRef = useRef<string | null>(null);
 
   const activeFilterCount = useMemo(() => {
     let count = 0;
@@ -250,8 +254,7 @@ export function ResultsLayout() {
   const filtersActive = activeFilterCount > 0;
 
   const resetFilters = useCallback(() => {
-    // Resets to the strict default (matches first-run behaviour), not "all"
-    setEligibilityFilter(STRICT_ELIGIBILITY_DEFAULT);
+    setEligibilityFilter([]);  // empty = show all tiers
     setSortMode("recent");
     setSearch("");
     setOnlyFutureDeadlines(false);
@@ -317,14 +320,15 @@ export function ResultsLayout() {
               addedKeys.forEach((k) => next.add(k));
               return next;
             });
-            // Fade out "new" badges after 35 seconds
-            setTimeout(() => {
-              setNewResultKeys((prev) => {
-                const next = new Set(prev);
-                addedKeys.forEach((k) => next.delete(k));
-                return next;
-              });
-            }, 35_000);
+            // Persist new keys with timestamp — expire after 24h or when opened
+            try {
+              const stored: Record<string, number> = JSON.parse(
+                localStorage.getItem(NEW_KEYS_STORAGE) || "{}"
+              );
+              const now = Date.now();
+              addedKeys.forEach((k) => { stored[k] = now; });
+              localStorage.setItem(NEW_KEYS_STORAGE, JSON.stringify(stored));
+            } catch {}
           }
         }
 
@@ -384,6 +388,18 @@ export function ResultsLayout() {
     try {
       const archived = JSON.parse(localStorage.getItem(ARCHIVED_KEY) || "[]");
       setArchivedUrls(new Set(Array.isArray(archived) ? archived : []));
+    } catch {}
+    // Load persisted "new" keys — keep only those < 24h old
+    try {
+      const storedNew: Record<string, number> = JSON.parse(
+        localStorage.getItem(NEW_KEYS_STORAGE) || "{}"
+      );
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      const valid = Object.entries(storedNew).filter(([, ts]) => ts > cutoff);
+      if (valid.length > 0) setNewResultKeys(new Set(valid.map(([k]) => k)));
+      if (valid.length !== Object.keys(storedNew).length) {
+        localStorage.setItem(NEW_KEYS_STORAGE, JSON.stringify(Object.fromEntries(valid)));
+      }
     } catch {}
   }, []);
 
@@ -498,6 +514,20 @@ export function ResultsLayout() {
         next.has(rowKey) ? next.delete(rowKey) : next.add(rowKey);
         return next;
       });
+      // Opening a row dismisses its "new" highlight
+      setNewResultKeys((prev) => {
+        if (!prev.has(rowKey)) return prev;
+        const next = new Set(prev);
+        next.delete(rowKey);
+        try {
+          const stored: Record<string, number> = JSON.parse(
+            localStorage.getItem(NEW_KEYS_STORAGE) || "{}"
+          );
+          delete stored[rowKey];
+          localStorage.setItem(NEW_KEYS_STORAGE, JSON.stringify(stored));
+        } catch {}
+        return next;
+      });
     },
     [pinnedRowKey]
   );
@@ -518,13 +548,33 @@ export function ResultsLayout() {
   const allChecked =
     visibleResults.length > 0 && visibleResults.every((row) => checkedUrls.has(row.fund_url || ""));
 
-  const toggleCheck = useCallback((url: string) => {
-    setCheckedUrls((prev) => {
-      const next = new Set(prev);
-      next.has(url) ? next.delete(url) : next.add(url);
-      return next;
-    });
-  }, []);
+  const toggleCheck = useCallback(
+    (url: string, shiftKey?: boolean) => {
+      setCheckedUrls((prev) => {
+        const next = new Set(prev);
+        if (shiftKey && lastCheckedUrlRef.current && lastCheckedUrlRef.current !== url) {
+          const lastIdx = visibleResults.findIndex((r) => r.fund_url === lastCheckedUrlRef.current);
+          const currIdx = visibleResults.findIndex((r) => r.fund_url === url);
+          if (lastIdx !== -1 && currIdx !== -1) {
+            const from = Math.min(lastIdx, currIdx);
+            const to = Math.max(lastIdx, currIdx);
+            const shouldCheck = !prev.has(url);
+            for (let i = from; i <= to; i++) {
+              const rowUrl = visibleResults[i]?.fund_url || "";
+              if (rowUrl) shouldCheck ? next.add(rowUrl) : next.delete(rowUrl);
+            }
+          } else {
+            next.has(url) ? next.delete(url) : next.add(url);
+          }
+        } else {
+          next.has(url) ? next.delete(url) : next.add(url);
+        }
+        lastCheckedUrlRef.current = url;
+        return next;
+      });
+    },
+    [visibleResults]
+  );
 
   const toggleCheckAll = useCallback(() => {
     if (allChecked) {
@@ -671,6 +721,8 @@ export function ResultsLayout() {
         isStrictView={isStrictView}
         onShowAllCandidates={showAllCandidates}
       />
+
+      <ScrapeQueueBanner />
 
       <div className="card-base overflow-hidden">
         <ResultsToolbar

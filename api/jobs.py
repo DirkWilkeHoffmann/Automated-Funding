@@ -108,6 +108,11 @@ class JobStore:
         with self._lock:
             return self._jobs.get(job_id)
 
+    def list_active(self) -> list[Job]:
+        """Return all in-progress (not-done) jobs."""
+        with self._lock:
+            return [j for j in self._jobs.values() if not j.progress.done]
+
 
 def _persist_job_created(job_id: str, urls: List[str]) -> None:
     try:

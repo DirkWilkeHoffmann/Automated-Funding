@@ -37,7 +37,7 @@ interface ResultsTableProps {
   checkedUrls?: Set<string>;
   starredUrls?: Set<string>;
   allChecked?: boolean;
-  onToggleCheck?: (url: string) => void;
+  onToggleCheck?: (url: string, shiftKey?: boolean) => void;
   onToggleCheckAll?: () => void;
   onRescrape?: (url: string) => void;
 }
@@ -85,6 +85,50 @@ function getDeadlineClass(deadline: string | null | undefined): string {
 function formatValue(val: any): string {
   if (val === null || val === undefined || val === "") return "";
   return Array.isArray(val) ? val.join(", ") : String(val);
+}
+
+function TagList({ value, query, max = 3 }: { value: any; query: string; max?: number }) {
+  if (!value) return <span className="text-slate-300">—</span>;
+  const tags = String(value).split(";").map((t) => t.trim()).filter(Boolean);
+  if (tags.length === 0) return <span className="text-slate-300">—</span>;
+  const visible = tags.slice(0, max);
+  const overflow = tags.length - max;
+  return (
+    <div className="flex flex-wrap gap-1">
+      {visible.map((tag, i) => (
+        <span
+          key={`${tag}-${i}`}
+          className="inline-flex items-center rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-600"
+        >
+          {highlightText(tag, query)}
+        </span>
+      ))}
+      {overflow > 0 && (
+        <span className="inline-flex items-center rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-400">
+          +{overflow}
+        </span>
+      )}
+    </div>
+  );
+}
+
+const STATUS_STYLES: Record<string, string> = {
+  open:     "border-emerald-200 bg-emerald-50 text-emerald-700",
+  rolling:  "border-teal-200 bg-teal-50 text-teal-700",
+  closed:   "border-red-200 bg-red-50 text-red-600",
+  paused:   "border-amber-200 bg-amber-50 text-amber-700",
+  seasonal: "border-purple-200 bg-purple-50 text-purple-700",
+  unclear:  "border-slate-200 bg-slate-50 text-slate-500",
+};
+
+function StatusBadge({ status }: { status: string | null | undefined }) {
+  const s = (status || "unclear").toLowerCase();
+  const cls = STATUS_STYLES[s] ?? STATUS_STYLES.unclear;
+  return (
+    <span className={cn("inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide", cls)}>
+      {s}
+    </span>
+  );
 }
 
 export function getRowKey(row: ResultRecord, idx: number): string {
@@ -150,8 +194,8 @@ function groupResults(
 const RUBRIC_DIMENSION_ORDER: { key: string; label: string; veto: boolean }[] = [
   { key: "geography",          label: "Geography",          veto: true },
   { key: "applicant_type",     label: "Applicant type",     veto: true },
-  { key: "topic_focus",        label: "Topic / focus",      veto: false },
-  { key: "beneficiary",        label: "Beneficiary",        veto: false },
+  { key: "topic_focus",        label: "Topic / focus",      veto: true },
+  { key: "beneficiary",        label: "Beneficiary",        veto: true },
   { key: "org_history",        label: "Org history / age",  veto: true },
   { key: "grant_size",         label: "Grant size",         veto: false },
   { key: "cost_share",         label: "Cost-share",         veto: true },
@@ -380,23 +424,29 @@ const rowUrl = row.fund_url || "";
                     className={cn(
                       "grid cursor-pointer grid-cols-[32px_44px_1fr_0.6fr_0.38fr] px-4 py-3 transition-colors",
                       "hover:bg-slate-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand/40",
-                      isSelected && !isPinned && "bg-slate-50/80",
+                      isNew && !isExpanded && !isPinned && "bg-sky-50/70",
+                      isSelected && !isPinned && !isNew && "bg-slate-50/80",
                       isPinned && "bg-brand-50/30 ring-1 ring-inset ring-brand/20",
-                      isChecked && "bg-brand/5"
+                      isChecked && !isNew && "bg-brand/5"
                     )}
                     onClick={() => onRowSelect(rowKey)}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") onRowSelect(rowKey);
                     }}
                   >
-                    {/* Checkbox */}
+                    {/* Checkbox — shift-click selects a range */}
                     <div className="flex items-start pt-1" onClick={(e) => e.stopPropagation()}>
                       <input
                         type="checkbox"
                         checked={isChecked}
-                        onChange={() => onToggleCheck?.(rowUrl)}
-                        className="h-3.5 w-3.5 rounded border-slate-300 accent-brand"
+                        onChange={() => {}}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onToggleCheck?.(rowUrl, e.shiftKey);
+                        }}
+                        className="h-3.5 w-3.5 cursor-pointer rounded border-slate-300 accent-brand"
                         aria-label="Select row"
+                        title="Click to select · Shift+click to select range"
                       />
                     </div>
 
@@ -465,22 +515,22 @@ const rowUrl = row.fund_url || "";
                     </div>
 
                     {/* Audience & scope */}
-                    <div className="min-w-0 space-y-0.5 pr-4 text-xs text-slate-600">
+                    <div className="min-w-0 space-y-1.5 pr-4 text-xs text-slate-600">
                       {row.applicant_types && (
-                        <p className="truncate">
-                          <span className="font-medium text-slate-700">Applicants:</span>{" "}
-                          {highlightText(formatValue(row.applicant_types), searchQuery)}
-                        </p>
+                        <div>
+                          <span className="mb-0.5 block text-[10px] font-semibold uppercase tracking-wider text-slate-400">Applicants</span>
+                          <TagList value={row.applicant_types} query={searchQuery} />
+                        </div>
                       )}
                       {row.beneficiary_focus && (
-                        <p className="truncate">
-                          <span className="font-medium text-slate-700">Focus:</span>{" "}
-                          {highlightText(formatValue(row.beneficiary_focus), searchQuery)}
-                        </p>
+                        <div>
+                          <span className="mb-0.5 block text-[10px] font-semibold uppercase tracking-wider text-slate-400">Focus</span>
+                          <TagList value={row.beneficiary_focus} query={searchQuery} />
+                        </div>
                       )}
                       {row.geographic_scope && (
-                        <p className="truncate">
-                          <span className="font-medium text-slate-700">Scope:</span>{" "}
+                        <p className="truncate text-[11px]">
+                          <span className="font-medium text-slate-500">Scope:</span>{" "}
                           {highlightText(formatValue(row.geographic_scope), searchQuery)}
                         </p>
                       )}
@@ -488,11 +538,9 @@ const rowUrl = row.fund_url || "";
 
                     {/* Status & deadline */}
                     <div className="min-w-0 space-y-1">
-                      <Badge variant="muted" className="w-fit">
-                        {highlightText(row.application_status || "Not stated", searchQuery)}
-                      </Badge>
+                      <StatusBadge status={row.application_status} />
                       {row.deadline && (
-                        <p className="truncate text-xs text-slate-500">
+                        <p className={cn("truncate text-xs", getDeadlineClass(row.deadline))}>
                           {highlightText(row.deadline, searchQuery)}
                         </p>
                       )}

@@ -169,6 +169,25 @@ def scrape_batch(
     )
 
 
+@router.get("/jobs", status_code=status.HTTP_200_OK)
+def list_active_jobs(_user=Depends(dependencies.require_user)):
+    """Return summary of all in-progress scrape jobs (for the results-page queue banner)."""
+    jobs = job_store.list_active()
+    return {
+        "jobs": [
+            {
+                "job_id": j.id,
+                "total_urls": len(j.urls),
+                "completed_urls": len(j.progress.results),
+                "progress_percent": j.progress.progress_percent,
+                "current_url": j.progress.current_url,
+                "done": j.progress.done,
+            }
+            for j in jobs
+        ]
+    }
+
+
 @router.post("/jobs/{job_id}/cancel", status_code=status.HTTP_200_OK)
 def cancel_job(job_id: str, _user=Depends(dependencies.require_user)):
     job = job_store.get(job_id)
