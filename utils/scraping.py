@@ -1,8 +1,12 @@
 """Web scraping and HTML extraction utilities."""
 
 import io
+import ipaddress
 import logging
+import os
 import re
+import socket
+import threading
 import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,6 +19,11 @@ from utils.constants import (
     DISCOVERY_DEPTH,
     HEADERS,
     KEYWORDS,
+    LISTING_EXCLUDED_DOMAINS,
+    LISTING_GRANT_LINK_KEYWORDS,
+    LISTING_SIGNAL_THRESHOLD,
+    LISTING_TITLE_KEYWORDS,
+    LISTING_URL_KEYWORDS,
     MAX_DISCOVERY_PAGES,
     MAX_PAGES,
     PAUSE_BETWEEN_REQUESTS,
@@ -29,12 +38,107 @@ from utils.utils_helpers import (
 logger = logging.getLogger(__name__)
 
 _html_cache: "OrderedDict[str, Tuple[str, float]]" = OrderedDict()
+
+_JUNK_PATTERNS = (
+    "comment-page-", "replytocom=", "share=", "like=",
+    "action=share", "utm_",
+)
+
+_GRANT_PATH_KEYWORDS = frozenset({
+    "grant", "apply", "fund", "giving", "invest",
+    "opportunity", "award", "support", "programme", "program",
+    "donate", "philanthropy", "funding",
+})
+
+_PLAYWRIGHT_WORD_THRESHOLD = 150
+
+# Cap concurrent headless-Chromium instances. The Azure Container App is
+# 0.5 vCPU / 1 GiB — uncapped Chromium across the discovery thread-pool OOMs.
+_PW_SEM = threading.BoundedSemaphore(int(os.getenv("PLAYWRIGHT_MAX_CONCURRENCY", "1")))
+
+
+def _is_junk_url(url: str) -> bool:
+    """Return True for comment pages, social share variants, and tracking URLs."""
+    lower = url.lower()
+    return any(p in lower for p in _JUNK_PATTERNS)
+
+
+def _word_count(text: str) -> int:
+    """Return the number of whitespace-separated words in text."""
+    return len(text.split())
+
+
+def playwright_fetch(url: str) -> Optional[str]:
+    """Fetch a URL with headless Chromium, waiting for JS to render.
+
+    Returns raw HTML string, or None on failure or missing dependency.
+    Only call this when BS4 extraction yields fewer than _PLAYWRIGHT_WORD_THRESHOLD words.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log_message("playwright not installed — skipping JS render fallback", "warning")
+        return None
+    try:
+        with _PW_SEM:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(url, wait_until="networkidle", timeout=30000)
+                content = page.content()
+                browser.close()
+                return content
+    except Exception as exc:
+        log_message(f"Playwright fetch failed for {url}: {exc}", "warning")
+        return None
+
+
+def _is_safe_url(url: str) -> bool:
+    """Return True only when the URL is safe to fetch.
+
+    Blocks loopback, private, link-local, reserved, and unspecified addresses
+    to prevent SSRF attacks (e.g. probing 127.0.0.1, 169.254.169.254, 10.x,
+    192.168.x, fd00::, etc.).  Only http/https schemes are allowed.
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = (parsed.hostname or "").rstrip(".").lower()
+        if not host:
+            return False
+        try:
+            addrinfos = socket.getaddrinfo(host, None)
+        except socket.gaierror:
+            return False
+        for info in addrinfos:
+            addr_str = info[4][0]
+            try:
+                ip = ipaddress.ip_address(addr_str)
+                if (
+                    ip.is_loopback
+                    or ip.is_private
+                    or ip.is_link_local
+                    or ip.is_reserved
+                    or ip.is_unspecified
+                    or ip.is_multicast
+                ):
+                    log_message(f"SSRF guard: blocked {url} → {ip}", "warning")
+                    return False
+            except ValueError:
+                return False
+        return True
+    except Exception:
+        return False
 _HTML_CACHE_MAX = 500
 _CACHE_TTL = 86400  # 24 hours
 
 
 def fetch_page(url: str, retries: int = 4, backoff_factor: int = 2) -> Optional[str]:
     """Fetch a page with exponential backoff on rate limiting. Caches responses for 24h."""
+    if not _is_safe_url(url):
+        log_message(f"fetch_page: refused to fetch unsafe URL: {url}", "warning")
+        return None
     cached = _html_cache.get(url)
     if cached:
         html, ts = cached
@@ -159,6 +263,8 @@ def discover_links(
                 continue
 
             hnorm = normalize_url(href)
+            if _is_junk_url(hnorm):
+                continue
             anchor = (a.get_text(" ", strip=True) or "").strip()
             meta = candidates.setdefault(
                 hnorm, {"anchor_texts": set(), "source_titles": set(), "source_snippets": set()}
@@ -206,6 +312,18 @@ def prioritized_crawl(seed_url: str) -> Tuple[str, str, int, List[str], Dict[str
     """
     Crawl and prioritize the most relevant internal pages for a seed URL.
 
+    PATH-PREFIX RULE (2026-05-31 fix):
+      Only follow links whose URL path is the seed itself or a SUB-path of
+      the seed. This prevents a critical bug on aggregator sites like
+      fundsforngos.org where every "/{category}/{slug}" sibling page outscored
+      the seed (because all the URL slugs contain grant keywords) and got
+      concatenated into the LLM's input, polluting field extraction (deadlines,
+      amounts, etc. would be from sibling grants, not the seed).
+
+    SEED-FIRST RULE:
+      The seed URL is ALWAYS fetched first, unconditionally. Previously the
+      seed could be bumped out of the top-N by higher-scoring siblings.
+
     Returns:
         (combined_text, folder_path, num_pages_visited, visited_urls, pdf_metadata)
     """
@@ -218,15 +336,60 @@ def prioritized_crawl(seed_url: str) -> Tuple[str, str, int, List[str], Dict[str
     domain_folder = os.path.join(SAVE_DIR, safe_filename_from_url(seed_base))
     os.makedirs(domain_folder, exist_ok=True)
 
+    seed_path = urlparse(seed_norm).path.rstrip("/")
+
+    def _is_sub_path(candidate_url: str) -> bool:
+        """True if candidate's path is the seed path or a sub-path of it.
+
+        Examples (seed = /education/apply-for-da-young-leaders):
+          /education/apply-for-da-young-leaders/         → True (same)
+          /education/apply-for-da-young-leaders/guidelines → True (sub)
+          /education/apply-for-da-young-leaders-OTHER    → False (sibling at same depth)
+          /individuals/apply-for-henry-moore             → False (different branch)
+          /                                              → False
+
+        Root URL rule:
+          For root URLs (seed_path=""), allow the seed itself OR depth-1 pages
+          whose path segment contains a grant-related keyword (e.g. /grants, /apply).
+        """
+        if not seed_path:
+            # Root URL — allow exact seed OR depth-1 pages with grant-related path keywords
+            if candidate_url == seed_norm:
+                return True
+            cand_path = urlparse(candidate_url).path.lower().rstrip("/")
+            path_parts = [p for p in cand_path.split("/") if p]
+            if len(path_parts) == 1 and any(kw in path_parts[0] for kw in _GRANT_PATH_KEYWORDS):
+                return True
+            return False
+        cand_path = urlparse(candidate_url).path.rstrip("/")
+        if cand_path == seed_path:
+            return True
+        # Sub-path must START with seed_path followed by "/" (so we don't
+        # accept "/foo-other" as a sub of "/foo").
+        return cand_path.startswith(seed_path + "/")
+
     candidates = discover_links(seed_norm)
+
+    # Apply the path-prefix filter. The seed itself is always re-added so it
+    # survives even if discover_links produced an empty set.
+    candidates = {url: meta for url, meta in candidates.items() if _is_sub_path(url)}
     candidates.setdefault(
         seed_norm, {"anchor_texts": set(), "source_titles": set(), "source_snippets": set()}
     )
+
     scored = [(score_candidate(url, meta), url) for url, meta in candidates.items()]
     scored.sort(reverse=True)
 
-    top_links = [url for _, url in scored[:MAX_PAGES]]
-    log_message(f"Fetching top {len(top_links)} links from {seed_base}")
+    # Build fetch order: seed FIRST, then top-scored sub-paths up to MAX_PAGES.
+    ordered: List[str] = [seed_norm]
+    for _, url in scored:
+        if url != seed_norm and url not in ordered:
+            ordered.append(url)
+    top_links = ordered[:MAX_PAGES]
+    log_message(
+        f"Fetching {len(top_links)} page(s) from {seed_base} "
+        f"(seed first, sub-paths only, dropped {len(scored) - len(top_links) + (0 if seed_norm in [u for _, u in scored] else 1)} sibling candidates)"
+    )
 
     visited_urls: List[str] = []
     seen_urls: set = set()
@@ -244,6 +407,20 @@ def prioritized_crawl(seed_url: str) -> Tuple[str, str, int, List[str], Dict[str
         if not html:
             continue
         text = extract_visible_text(html)
+        if _word_count(text) < _PLAYWRIGHT_WORD_THRESHOLD:
+            log_message(
+                f"Thin BS4 result ({_word_count(text)} words) for {url}; trying Playwright",
+                "info",
+            )
+            pw_html = playwright_fetch(url)
+            if pw_html:
+                pw_text = extract_visible_text(pw_html)
+                if _word_count(pw_text) > _word_count(text):
+                    log_message(
+                        f"Playwright improved extraction to {_word_count(pw_text)} words for {url}",
+                        "info",
+                    )
+                    text = pw_text
         all_text.append(text)
         fname = safe_filename_from_url(url) + ".txt"
         with open(os.path.join(domain_folder, fname), "w", encoding="utf-8") as f:
@@ -252,3 +429,111 @@ def prioritized_crawl(seed_url: str) -> Tuple[str, str, int, List[str], Dict[str
 
     combined_text = " ".join(all_text)
     return combined_text, domain_folder, len(all_text), visited_urls, pdf_meta
+
+
+def detect_listing_page(url: str, text: str) -> bool:
+    """Return True when the page looks like an aggregator/listing of multiple grants.
+
+    Fires on ≥LISTING_SIGNAL_THRESHOLD of five heuristic signals so that a single
+    keyword hit doesn't wrongly classify a real grant detail page.
+    """
+    signals = 0
+    url_lower = url.lower()
+    text_lower = text.lower()
+
+    # 1. URL-path pattern
+    if any(kw in url_lower for kw in LISTING_URL_KEYWORDS):
+        signals += 1
+
+    # 2. Title / early content contains listing-indicator phrase
+    if any(kw in text_lower[:800] for kw in LISTING_TITLE_KEYWORDS):
+        signals += 1
+
+    # 3. Deadline density — ≥3 separate mentions
+    if text_lower.count("deadline") >= 3:
+        signals += 1
+
+    # 4. Apply / read-more density
+    if text_lower.count("apply now") + text_lower.count("read more") >= 3:
+        signals += 1
+
+    # 5. Currency-amount density — ≥5 separate amounts suggests many grants
+    if len(re.findall(r'[\$£€]\s*[\d,]+|\bUSD\s*[\d,]+|\bZAR\s*[\d,]+', text)) >= 5:
+        signals += 1
+
+    return signals >= LISTING_SIGNAL_THRESHOLD
+
+
+def extract_listing_urls(seed_url: str, max_results: int = 60) -> List[Dict[str, str]]:
+    """Extract individual grant-opportunity URLs from a listing/aggregator page.
+
+    Parses both same-domain AND external links from the page HTML — listing pages
+    often link out to actual funder websites. Returns a list of
+    ``{"url": str, "title": str}`` dicts, capped at *max_results*.
+    """
+    html = fetch_page(seed_url)
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    seed_parsed = urlparse(seed_url)
+    seed_domain = seed_parsed.netloc.replace("www.", "")
+    seed_norm = normalize_url(seed_url)
+
+    _EXCLUDE_PATH_FRAGMENTS = {"/category/", "/tag/", "/author/", "/archive/", "/page/"}
+
+    candidates: List[Dict[str, str]] = []
+    seen: set = set()
+
+    for a in soup.find_all("a", href=True):
+        raw_href = (a.get("href") or "").strip()
+        if not raw_href or raw_href.startswith("#") or raw_href.startswith("javascript:") or raw_href.startswith("mailto:"):
+            continue
+
+        full_url = urljoin(seed_url, raw_href)
+        if not full_url.startswith("http"):
+            continue
+
+        parsed = urlparse(full_url)
+        link_domain = parsed.netloc.replace("www.", "")
+        path = parsed.path.lower()
+
+        # Skip social / analytics domains
+        if any(excl in link_domain for excl in LISTING_EXCLUDED_DOMAINS):
+            continue
+
+        # Skip the seed URL itself
+        norm = normalize_url(full_url)
+        if norm == seed_norm or norm in seen:
+            continue
+
+        # Skip file downloads
+        if any(path.endswith(ext) for ext in (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip", ".doc", ".docx")):
+            continue
+
+        anchor = (a.get_text(" ", strip=True) or "").strip()
+        combined = (anchor + " " + path).lower()
+        has_grant_kw = any(kw in combined for kw in LISTING_GRANT_LINK_KEYWORDS)
+
+        is_same_domain = seed_domain in link_domain
+        is_external = not is_same_domain
+        path_depth = len([p for p in path.split("/") if p])
+
+        # Same-domain links: include if depth ≥ 2 and not an archive/category path
+        if is_same_domain:
+            if path_depth >= 2 and not any(frag in path for frag in _EXCLUDE_PATH_FRAGMENTS):
+                seen.add(norm)
+                title = anchor or path.rstrip("/").split("/")[-1].replace("-", " ").title() or full_url
+                candidates.append({"url": full_url, "title": title[:120]})
+
+        # External links: only include when anchor text / URL signals a grant
+        elif is_external and has_grant_kw:
+            seen.add(norm)
+            title = anchor or link_domain
+            candidates.append({"url": full_url, "title": title[:120]})
+
+        if len(candidates) >= max_results:
+            break
+
+    log_message(f"extract_listing_urls: found {len(candidates)} candidate URLs from {seed_url}")
+    return candidates

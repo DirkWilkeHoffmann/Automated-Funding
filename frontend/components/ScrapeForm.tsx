@@ -22,6 +22,7 @@ import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import { Progress } from "./ui/progress";
 import { cn } from "../lib/utils";
+import { ListingExpandPanel, type ListingItem } from "./ListingExpandPanel";
 
 type JobStatus = {
   job_id: string;
@@ -85,6 +86,7 @@ export default function ScrapeForm() {
   const [queueStats, setQueueStats] = useState<QueueStats>({ uniqueDomains: 0, totalQueued: 0 });
   const [hydratedCache, setHydratedCache] = useState(false);
   const lastCompletedJobId = useRef<string | null>(null);
+  const [listingPreview, setListingPreview] = useState<{ sourceUrl: string; items: ListingItem[] } | null>(null);
 
   const resetAll = () => {
     setManualInput("");
@@ -133,6 +135,11 @@ export default function ScrapeForm() {
         const status = await api.jobStatus(job.job_id);
         setJob(status);
       } catch (err: any) {
+        const msg = (err?.message || "").toLowerCase();
+        if (msg.includes("not found") || msg.includes("404")) {
+          // Server restarted — stop polling and mark done so results stay visible.
+          setJob((prev) => prev ? { ...prev, done: true, progress_percent: 100 } : null);
+        }
         console.error(err);
       }
     }, 4000);
@@ -168,7 +175,26 @@ export default function ScrapeForm() {
     }
   };
 
-  const handleManualStage = () => prepareAndStage(detectedManualUrls);
+  const handleManualStage = async () => {
+    // For a single URL, run the listing-page preview first so the user can
+    // select individual grants before they hit the scrape queue.
+    if (detectedManualUrls.length === 1) {
+      setIsPreparing(true);
+      setPrepError(null);
+      try {
+        const preview = await api.previewScrapeUrl(detectedManualUrls[0]);
+        if (preview.type === "listing" && preview.items.length > 0) {
+          setListingPreview({ sourceUrl: detectedManualUrls[0], items: preview.items });
+          return;
+        }
+      } catch {
+        // Preview failed — fall through to normal staging
+      } finally {
+        setIsPreparing(false);
+      }
+    }
+    prepareAndStage(detectedManualUrls);
+  };
 
   const handleCsvUpload = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -328,6 +354,20 @@ export default function ScrapeForm() {
           </div>
         </div>
       </div>
+
+      {/* Listing expand panel — shown when a single URL resolves to a listing page */}
+      {listingPreview && (
+        <ListingExpandPanel
+          sourceUrl={listingPreview.sourceUrl}
+          items={listingPreview.items}
+          onConfirm={(selectedUrls) => {
+            setListingPreview(null);
+            setManualInput("");
+            prepareAndStage(selectedUrls);
+          }}
+          onDismiss={() => setListingPreview(null)}
+        />
+      )}
 
       {/* Queue */}
       <div className="card-base overflow-hidden">

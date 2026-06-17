@@ -11,6 +11,9 @@ from api.schemas import (
     JobStatusResponse,
     PrepareUrlsRequest,
     PrepareUrlsResponse,
+    ScrapePreviewItem,
+    ScrapePreviewRequest,
+    ScrapePreviewResponse,
     ScrapeRequest,
     ScrapeResponse,
 )
@@ -58,6 +61,38 @@ def _prepare_urls_for_scrape(
         "duplicates_in_payload": duplicates_in_payload,
         "normalized_map": normalized_map,
     }
+
+
+@router.post("/preview", response_model=ScrapePreviewResponse, status_code=status.HTTP_200_OK)
+def preview_url(
+    payload: ScrapePreviewRequest,
+    _user=Depends(dependencies.require_user),
+) -> ScrapePreviewResponse:
+    """Inspect a URL and return whether it is a listing/aggregator page.
+
+    If ``type == "listing"``, the caller should show the user the extracted
+    URLs for selection before starting a scrape job.
+    If ``type == "single"``, the caller can proceed directly to scraping.
+    """
+    from utils.scraping import (
+        detect_listing_page,
+        extract_listing_urls,
+        extract_visible_text,
+        fetch_page,
+    )
+
+    url = str(payload.url).strip()
+    html = fetch_page(url)
+    if not html:
+        return ScrapePreviewResponse(type="single")
+
+    text = extract_visible_text(html)
+    if not detect_listing_page(url, text):
+        return ScrapePreviewResponse(type="single")
+
+    raw_items = extract_listing_urls(url)
+    items = [ScrapePreviewItem(url=item["url"], title=item["title"]) for item in raw_items]
+    return ScrapePreviewResponse(type="listing", items=items, count=len(items))
 
 
 @router.post("/prepare", response_model=PrepareUrlsResponse, status_code=status.HTTP_200_OK)
@@ -134,6 +169,25 @@ def scrape_batch(
     )
 
 
+@router.get("/jobs", status_code=status.HTTP_200_OK)
+def list_active_jobs(_user=Depends(dependencies.require_user)):
+    """Return summary of all in-progress scrape jobs (for the results-page queue banner)."""
+    jobs = job_store.list_active()
+    return {
+        "jobs": [
+            {
+                "job_id": j.id,
+                "total_urls": len(j.urls),
+                "completed_urls": len(j.progress.results),
+                "progress_percent": j.progress.progress_percent,
+                "current_url": j.progress.current_url,
+                "done": j.progress.done,
+            }
+            for j in jobs
+        ]
+    }
+
+
 @router.post("/jobs/{job_id}/cancel", status_code=status.HTTP_200_OK)
 def cancel_job(job_id: str, _user=Depends(dependencies.require_user)):
     job = job_store.get(job_id)
@@ -146,24 +200,54 @@ def cancel_job(job_id: str, _user=Depends(dependencies.require_user)):
 @router.get("/jobs/{job_id}", response_model=JobStatusResponse)
 def job_status(job_id: str, _user=Depends(dependencies.require_user)):
     job = job_store.get(job_id)
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job:
+        snapshot = job.snapshot()
+        errors = [JobError(url=err[0], message=err[1]) for err in snapshot["errors"]]
+        return JobStatusResponse(
+            job_id=snapshot["job_id"],
+            done=snapshot["done"],
+            progress_percent=snapshot["progress_percent"],
+            results=snapshot["results"],
+            errors=errors,
+            current_url=snapshot.get("current_url"),
+            current_elapsed_seconds=snapshot.get("current_elapsed_seconds", 0),
+            total_elapsed_seconds=snapshot.get("total_elapsed_seconds", 0),
+            started_at=snapshot.get("started_at"),
+            finished_at=snapshot.get("finished_at"),
+            url_timings=snapshot.get("url_timings", []),
+            total_urls=snapshot.get("total_urls", 0),
+            completed_urls=snapshot.get("completed_urls", 0),
+        )
 
-    snapshot = job.snapshot()
-    errors = [JobError(url=err[0], message=err[1]) for err in snapshot["errors"]]
-    # TODO: extend this endpoint (or add websockets/server-sent events) to push live status updates to clients.
-    return JobStatusResponse(
-        job_id=snapshot["job_id"],
-        done=snapshot["done"],
-        progress_percent=snapshot["progress_percent"],
-        results=snapshot["results"],
-        errors=errors,
-        current_url=snapshot.get("current_url"),
-        current_elapsed_seconds=snapshot.get("current_elapsed_seconds", 0),
-        total_elapsed_seconds=snapshot.get("total_elapsed_seconds", 0),
-        started_at=snapshot.get("started_at"),
-        finished_at=snapshot.get("finished_at"),
-        url_timings=snapshot.get("url_timings", []),
-        total_urls=snapshot.get("total_urls", 0),
-        completed_urls=snapshot.get("completed_urls", 0),
-    )
+    # Fallback to DB — handles server restarts where in-memory state is lost.
+    try:
+        from datetime import datetime, timezone
+        from utils.db.client import get_supabase
+        resp = get_supabase().table("scrape_jobs").select(
+            "id,done,total_urls,completed_urls,progress_percent,finished_at"
+        ).eq("id", job_id).limit(1).execute()
+        rows = resp.data or []
+        if rows:
+            row = rows[0]
+            finished_at: Optional[float] = None
+            raw_finished = row.get("finished_at")
+            if raw_finished:
+                try:
+                    dt = datetime.fromisoformat(raw_finished.replace("Z", "+00:00"))
+                    finished_at = dt.timestamp()
+                except Exception:
+                    pass
+            return JobStatusResponse(
+                job_id=job_id,
+                done=bool(row.get("done", True)),
+                progress_percent=int(row.get("progress_percent") or 100),
+                results=[],
+                errors=[],
+                total_urls=int(row.get("total_urls") or 0),
+                completed_urls=int(row.get("completed_urls") or 0),
+                finished_at=finished_at,
+            )
+    except Exception:
+        pass
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")

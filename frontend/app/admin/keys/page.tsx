@@ -101,6 +101,7 @@ export default function KeysPage() {
   const openaiToken = tokens.find((t) => t.name === "openai");
   const samToken = tokens.find((t) => t.name === "sam_gov");
   const braveToken = tokens.find((t) => t.name === "brave_search");
+  const candidToken = tokens.find((t) => t.name === "candid");
 
   return (
     <div className="page-content space-y-6">
@@ -128,9 +129,16 @@ export default function KeysPage() {
         <TokenCard
           token={braveToken}
           label="Brave Search"
-          description="Optional but recommended. Powers AI web search in Auto-Discovery (free tier: 2,000 queries/month). Falls back to DuckDuckGo if not set."
+          description="(Deprecated — web search source was cut in Phase 4.) Key still accepted for historical compatibility but no longer used."
           placeholder="BSA…"
           onSave={async (key) => { await api.adminSetBraveKey(key); await reload(); }}
+        />
+        <TokenCard
+          token={candidToken}
+          label="Candid Essentials"
+          description="Paid. Optional. Unlocks the Candid grantmaker search source (foundation directory with NTEE filters). Toggle the 'candid' source on in Admin → Discovery once set."
+          placeholder="Candid API key…"
+          onSave={async (key) => { await api.adminSetCandidKey(key); await reload(); }}
         />
       </Section>
     </div>

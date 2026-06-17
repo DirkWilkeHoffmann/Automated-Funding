@@ -11,6 +11,30 @@ const SOURCE_MAP: Record<string, { label: string; className: string }> = {
     label: "SAM.gov",
     className: "bg-violet-50 text-violet-700 ring-1 ring-violet-200",
   },
+  federal_register: {
+    label: "Fed. Register",
+    className: "bg-rose-50 text-rose-700 ring-1 ring-rose-200",
+  },
+  state_portals: {
+    label: "State portals",
+    className: "bg-amber-50 text-amber-700 ring-1 ring-amber-200",
+  },
+  candid: {
+    label: "Candid",
+    className: "bg-pink-50 text-pink-700 ring-1 ring-pink-200",
+  },
+  irs_bmf: {
+    label: "IRS BMF",
+    className: "bg-blue-50 text-blue-700 ring-1 ring-blue-200",
+  },
+  grants_gov_db: {
+    label: "Grants.gov DB",
+    className: "bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200",
+  },
+  sam_cfda_db: {
+    label: "SAM CFDA",
+    className: "bg-violet-50 text-violet-700 ring-1 ring-violet-200",
+  },
   manual: {
     label: "Manual",
     className: "bg-slate-100 text-slate-600 ring-1 ring-slate-200",

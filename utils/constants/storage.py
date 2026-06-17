@@ -19,6 +19,7 @@ CSV_COLUMNS = [
     "grant_type",
     "eligibility",
     "evidence",
+    "match_rubric",
     "pages_scraped",
     "visited_urls_count",
     "pdf_read",
@@ -28,4 +29,7 @@ CSV_COLUMNS = [
     "extraction_timestamp",
     "error",
     "discovery_source",
+    "content_hash",
+    "last_checked_at",
+    "discovery_funder_ein",
 ]

@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Search, X } from "lucide-react";
-import { Checkbox } from "../ui/checkbox";
 import { Label } from "../ui/label";
 import { cn } from "../../lib/utils";
 
@@ -30,11 +29,11 @@ const groupByOptions: { value: GroupBy; label: string }[] = [
 ];
 
 const activeColorMap: Record<string, string> = {
-  emerald: "border-emerald-300 bg-emerald-50 text-emerald-800",
-  teal: "border-teal-300 bg-teal-50 text-teal-800",
-  amber: "border-amber-300 bg-amber-50 text-amber-800",
-  orange: "border-orange-300 bg-orange-50 text-orange-800",
-  red: "border-red-300 bg-red-50 text-red-700",
+  emerald: "border-emerald-300 bg-emerald-50 text-emerald-800 shadow-sm",
+  teal:    "border-teal-300 bg-teal-50 text-teal-800 shadow-sm",
+  amber:   "border-amber-300 bg-amber-50 text-amber-800 shadow-sm",
+  orange:  "border-orange-300 bg-orange-50 text-orange-800 shadow-sm",
+  red:     "border-red-300 bg-red-50 text-red-700 shadow-sm",
 };
 
 const sourceOptions = [
@@ -85,10 +84,7 @@ export function ResultsFilters({
   const [localSearch, setLocalSearch] = useState(search);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useEffect(() => {
-    setLocalSearch(search);
-  }, [search]);
-
+  useEffect(() => { setLocalSearch(search); }, [search]);
   useEffect(() => () => { if (debounceRef.current) clearTimeout(debounceRef.current); }, []);
 
   const handleSearchChange = useCallback(
@@ -106,39 +102,71 @@ export function ResultsFilters({
     onSearchChange("");
   }, [onSearchChange]);
 
+  const toggleEligibility = useCallback(
+    (value: string) => {
+      if (eligibilityFilter.includes(value)) {
+        const next = eligibilityFilter.filter((v) => v !== value);
+        onEligibilityChange(next);
+      } else {
+        onEligibilityChange([...eligibilityFilter, value]);
+      }
+    },
+    [eligibilityFilter, onEligibilityChange]
+  );
+
+  // "All" = no eligibility filter active
+  const allShown = eligibilityFilter.length === 0;
+
   return (
-    <div className="space-y-4 border-b border-slate-100 px-6 py-4">
-      {/* Eligibility filter chips */}
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+    <div className="space-y-3 border-b border-slate-100 px-6 py-3.5">
+      {/* Eligibility filter */}
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="mr-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
           Eligibility
         </span>
+
+        {/* All button */}
+        <button
+          type="button"
+          onClick={() => onEligibilityChange([])}
+          className={cn(
+            "rounded-full border px-3 py-1 text-xs font-medium transition-all",
+            allShown
+              ? "border-slate-400 bg-slate-800 text-white shadow-sm"
+              : "border-slate-200 bg-white text-slate-500 hover:border-slate-300 hover:bg-slate-50"
+          )}
+        >
+          All
+        </button>
+
         {eligibilityOptions.map(({ value, color }) => {
           const active = eligibilityFilter.includes(value);
           return (
-            <label
+            <button
               key={value}
+              type="button"
+              onClick={() => toggleEligibility(value)}
               className={cn(
-                "flex cursor-pointer items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-all",
+                "flex items-center gap-1 rounded-full border px-3 py-1 text-xs font-medium transition-all",
                 active
                   ? activeColorMap[color]
-                  : "border-slate-200 bg-white text-slate-600 hover:border-slate-300 hover:bg-slate-50"
+                  : "border-slate-200 bg-white text-slate-500 hover:border-slate-300 hover:bg-slate-50"
               )}
             >
-              <Checkbox
-                checked={active}
-                onChange={(e) => {
-                  const newFilter = e.target.checked
-                    ? [...eligibilityFilter, value]
-                    : eligibilityFilter.filter((v) => v !== value);
-                  onEligibilityChange(newFilter);
-                }}
-                className="sr-only"
-              />
+              {active && <span aria-hidden="true">✓</span>}
               {value}
-            </label>
+              {active && (
+                <span
+                  className="ml-0.5 opacity-50 hover:opacity-100"
+                  aria-label={`Remove ${value} filter`}
+                >
+                  ×
+                </span>
+              )}
+            </button>
           );
         })}
+
         {activeFilterCount > 0 && (
           <button
             type="button"
@@ -151,11 +179,11 @@ export function ResultsFilters({
         )}
       </div>
 
-      {/* Second row: sort, group-by, search, deadline, min funding */}
+      {/* Controls row */}
       <div className="flex flex-wrap items-end gap-3">
         {/* Sort */}
         <div className="space-y-1">
-          <Label htmlFor="result-sort" className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+          <Label htmlFor="result-sort" className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
             Sort
           </Label>
           <select
@@ -165,16 +193,14 @@ export function ResultsFilters({
             className="h-8 rounded-lg border border-slate-200 bg-white pl-3 pr-7 text-xs text-slate-900 shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
           >
             {sortOptions.map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
+              <option key={opt.value} value={opt.value}>{opt.label}</option>
             ))}
           </select>
         </div>
 
         {/* Group by */}
         <div className="space-y-1">
-          <Label htmlFor="result-groupby" className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+          <Label htmlFor="result-groupby" className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
             Group
           </Label>
           <select
@@ -184,16 +210,14 @@ export function ResultsFilters({
             className="h-8 rounded-lg border border-slate-200 bg-white pl-3 pr-7 text-xs text-slate-900 shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
           >
             {groupByOptions.map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
+              <option key={opt.value} value={opt.value}>{opt.label}</option>
             ))}
           </select>
         </div>
 
         {/* Source */}
         <div className="space-y-1">
-          <Label htmlFor="result-source" className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+          <Label htmlFor="result-source" className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
             Source
           </Label>
           <select
@@ -203,16 +227,14 @@ export function ResultsFilters({
             className="h-8 rounded-lg border border-slate-200 bg-white pl-3 pr-7 text-xs text-slate-900 shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
           >
             {sourceOptions.map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
+              <option key={opt.value} value={opt.value}>{opt.label}</option>
             ))}
           </select>
         </div>
 
         {/* Search */}
         <div className="min-w-[200px] flex-1 space-y-1">
-          <Label htmlFor="result-search" className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+          <Label htmlFor="result-search" className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
             Search
           </Label>
           <div className="relative">
@@ -240,16 +262,18 @@ export function ResultsFilters({
 
         {/* Future deadlines */}
         <label className="flex h-8 cursor-pointer items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50">
-          <Checkbox
+          <input
+            type="checkbox"
             checked={onlyFutureDeadlines}
             onChange={(e) => onFutureDeadlinesChange(e.target.checked)}
+            className="h-3.5 w-3.5 rounded border-slate-300 accent-brand"
           />
           Future deadlines only
         </label>
 
         {/* Min funding */}
         <div className="space-y-1">
-          <Label htmlFor="min-funding" className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+          <Label htmlFor="min-funding" className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
             Min funding
           </Label>
           <input
